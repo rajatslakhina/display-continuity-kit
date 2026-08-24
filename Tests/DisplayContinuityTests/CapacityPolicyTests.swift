@@ -1,0 +1,170 @@
+import XCTest
+@testable import DisplayContinuity
+
+final class CapacityPolicyTests: XCTestCase {
+
+    private let policy = AreaProportionalCapacityPolicy()
+
+    // MARK: - Exact derivations
+    //
+    // Asserting the actual numbers, not "the number is inside the range the
+    // implementation clamped it to". A range assertion over a clamped value is
+    // satisfied by any implementation at all, including one that returns the
+    // clamp bound unconditionally.
+
+    func testCompactPlanForCoverDisplayHasExactBudgets() {
+        let plan = policy.plan(for: .compact, viewport: .coverDisplay)
+        XCTAssertEqual(plan.displayClass, .compact)
+        XCTAssertEqual(plan.visibleWindow, 8)
+        XCTAssertEqual(plan.prefetchDepth, 4)
+        XCTAssertEqual(plan.concurrentDecodes, 2)
+        XCTAssertEqual(plan.decodeByteBudget, 12 * 524_288)
+        XCTAssertEqual(plan.admissionWindow, 16)
+    }
+
+    func testExpandedPlanForInnerDisplayHasExactBudgets() {
+        let plan = policy.plan(for: .expanded, viewport: .innerDisplay)
+        XCTAssertEqual(plan.displayClass, .expanded)
+        XCTAssertEqual(plan.visibleWindow, 9)
+        XCTAssertEqual(plan.prefetchDepth, 5)
+        XCTAssertEqual(plan.concurrentDecodes, 3)
+        XCTAssertEqual(plan.decodeByteBudget, 14 * 524_288)
+        XCTAssertEqual(plan.admissionWindow, 19)
+    }
+
+    /// The documented design decision, stated as an executable claim: prefetch
+    /// depth must grow *more slowly* than area. A linear-scaling regression
+    /// fails here.
+    func testPrefetchScalesSubLinearlyWithArea() {
+        let compact = policy.plan(for: .compact, viewport: .coverDisplay)
+        let expanded = policy.plan(for: .expanded, viewport: .innerDisplay)
+
+        let areaRatio = Viewport.innerDisplay.area / Viewport.coverDisplay.area
+        let prefetchRatio = Double(expanded.prefetchDepth) / Double(compact.prefetchDepth)
+
+        XCTAssertGreaterThan(areaRatio, 1.5, "the inner display really is much larger")
+        XCTAssertGreaterThan(prefetchRatio, 1.0, "but prefetch still grows")
+        XCTAssertLessThan(
+            prefetchRatio,
+            areaRatio,
+            "prefetch must grow sub-linearly with area — linear scaling is the rejected alternative"
+        )
+    }
+
+    /// The decode budget is the one that *is* allowed to track area, because
+    /// what is resident genuinely doubles.
+    func testDecodeBudgetGrowsWithTheSurface() {
+        let compact = policy.plan(for: .compact, viewport: .coverDisplay)
+        let expanded = policy.plan(for: .expanded, viewport: .innerDisplay)
+        XCTAssertGreaterThan(expanded.decodeByteBudget, compact.decodeByteBudget)
+    }
+
+    // MARK: - Degenerate geometry
+
+    func testZeroViewportStillProducesAUsablePlan() {
+        let plan = policy.plan(for: .compact, viewport: .zero)
+        XCTAssertEqual(plan.visibleWindow, 1)
+        XCTAssertEqual(plan.prefetchDepth, 1)
+        XCTAssertEqual(plan.concurrentDecodes, 1)
+        XCTAssertEqual(plan.admissionWindow, 3)
+    }
+
+    func testAbsurdViewportSaturatesRatherThanTraps() {
+        let huge = Viewport(width: 1e150, height: 1e150)
+        let plan = policy.plan(for: .expanded, viewport: huge)
+        XCTAssertEqual(plan.visibleWindow, 200, "clamped at the documented ceiling")
+        XCTAssertEqual(plan.prefetchDepth, 32, "clamped at the documented ceiling")
+        XCTAssertEqual(plan.concurrentDecodes, 6, "capped: more decoders is memory pressure, not speed")
+        XCTAssertGreaterThan(plan.decodeByteBudget, 0)
+    }
+
+    func testNonFiniteViewportIsSanitisedBeforeItReachesThePolicy() {
+        let broken = Viewport(width: .nan, height: .infinity)
+        let plan = policy.plan(for: .compact, viewport: broken)
+        XCTAssertEqual(plan.visibleWindow, 1)
+        XCTAssertEqual(plan.concurrentDecodes, 1)
+    }
+
+    // MARK: - Policy configuration
+
+    func testInvalidRowHeightFallsBackInsteadOfProducingInfiniteBudgets() {
+        let zeroRowHeight = AreaProportionalCapacityPolicy(rowHeight: 0)
+        let nanRowHeight = AreaProportionalCapacityPolicy(rowHeight: .nan)
+        let reference = AreaProportionalCapacityPolicy(rowHeight: 96)
+        XCTAssertEqual(
+            zeroRowHeight.plan(for: .compact, viewport: .coverDisplay),
+            reference.plan(for: .compact, viewport: .coverDisplay)
+        )
+        XCTAssertEqual(
+            nanRowHeight.plan(for: .compact, viewport: .coverDisplay),
+            reference.plan(for: .compact, viewport: .coverDisplay)
+        )
+    }
+
+    func testConcurrentDecodesRespectsAConfiguredCap() {
+        let capped = AreaProportionalCapacityPolicy(maximumConcurrentDecodes: 2)
+        let tall = Viewport(width: 716, height: 4_000)
+        XCTAssertEqual(capped.plan(for: .expanded, viewport: tall).concurrentDecodes, 2)
+    }
+
+    // MARK: - CapacityPlan invariants
+
+    func testPlanInitialiserRejectsNonsenseBudgets() {
+        let plan = CapacityPlan(
+            displayClass: .compact,
+            visibleWindow: -5,
+            prefetchDepth: -5,
+            concurrentDecodes: 0,
+            decodeByteBudget: -1
+        )
+        XCTAssertEqual(plan.visibleWindow, 0)
+        XCTAssertEqual(plan.prefetchDepth, 0)
+        XCTAssertEqual(plan.concurrentDecodes, 1)
+        XCTAssertEqual(plan.decodeByteBudget, 0)
+    }
+
+    func testAdmissionWindowSaturatesInsteadOfOverflowingNegative() {
+        let plan = CapacityPlan(
+            displayClass: .expanded,
+            visibleWindow: .max,
+            prefetchDepth: .max,
+            concurrentDecodes: 4,
+            decodeByteBudget: .max
+        )
+        XCTAssertEqual(plan.admissionWindow, .max, "must not wrap to a negative window")
+        XCTAssertGreaterThan(plan.admissionWindow, 0)
+    }
+
+    // MARK: - Display-class resolution
+
+    func testResolverUsesTheShorterEdgeNotTheArea() {
+        let resolver = MinimumEdgeDisplayClassResolver()
+        XCTAssertEqual(resolver.displayClass(for: .coverDisplay), .compact)
+        XCTAssertEqual(resolver.displayClass(for: .innerDisplay), .expanded)
+
+        // A short, very wide landscape phone has a large *area* but no room for
+        // a second pane. Area-based classification gets this wrong.
+        let landscapePhone = Viewport(width: 2_000, height: 390)
+        XCTAssertGreaterThan(landscapePhone.area, Viewport.innerDisplay.area)
+        XCTAssertEqual(resolver.displayClass(for: landscapePhone), .compact)
+    }
+
+    func testResolverRejectsAnInvalidThreshold() {
+        let broken = MinimumEdgeDisplayClassResolver(expandedThreshold: .nan)
+        XCTAssertEqual(broken.expandedThreshold, 600)
+        XCTAssertEqual(broken.displayClass(for: .coverDisplay), .compact)
+
+        let negative = MinimumEdgeDisplayClassResolver(expandedThreshold: -1)
+        XCTAssertEqual(negative.expandedThreshold, 600)
+        XCTAssertEqual(
+            negative.displayClass(for: .coverDisplay),
+            .compact,
+            "a negative threshold would otherwise classify everything as expanded"
+        )
+    }
+
+    func testResolverHonoursACustomThreshold() {
+        let eager = MinimumEdgeDisplayClassResolver(expandedThreshold: 300)
+        XCTAssertEqual(eager.displayClass(for: .coverDisplay), .expanded)
+    }
+}
