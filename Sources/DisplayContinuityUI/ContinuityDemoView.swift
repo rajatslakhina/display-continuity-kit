@@ -5,6 +5,7 @@
 // a naive migration would have cancelled and refetched.
 
 #if canImport(SwiftUI)
+import Foundation
 import SwiftUI
 import DisplayContinuity
 
@@ -88,7 +89,12 @@ public struct ContinuityDemoView: View {
             metric("Visible window", "\(model.plan.visibleWindow) rows")
             metric("Prefetch depth", "\(model.plan.prefetchDepth) rows")
             metric("Concurrent decodes", "\(model.plan.concurrentDecodes)")
-            metric("Decode budget", "\(model.plan.decodeByteBudget / 1_048_576) MB")
+            // Integer MB renders every sub-mebibyte budget as "0 MB", which is
+            // the one reading a viewer would take as a bug in the planner.
+            metric(
+                "Decode budget",
+                String(format: "%.1f MB", Double(model.plan.decodeByteBudget) / 1_048_576)
+            )
         }
     }
 
