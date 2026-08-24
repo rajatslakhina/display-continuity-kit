@@ -281,6 +281,104 @@ final class WorkExecutorTests: XCTestCase {
         XCTAssertEqual(state.cancelCount, 4, "the four that were running were cancelled")
     }
 
+    /// Under a binding concurrency limit, *which* work starts is the whole
+    /// question — and the answer must be the planner's answer.
+    ///
+    /// `ReplanDirective.admit` is sorted lexicographically so that two runs over
+    /// the same input produce byte-identical directives. That is reproducibility,
+    /// not scheduling: consuming it directly starts `row:10` before `row:2`,
+    /// because `"1" < "2"`. This is the test that catches it.
+    func testTheConcurrencyLimitStartsTheRowsNearestTheAnchorFirst() async {
+        let runner = BlockingRunner()
+        let executor = WorkExecutor(runner: runner, concurrencyLimit: 3)
+
+        let plan = CapacityPlan(
+            displayClass: .compact,
+            visibleWindow: 12,
+            prefetchDepth: 0,
+            concurrentDecodes: 3,
+            decodeByteBudget: 1_024
+        )
+        // Anchor at row 0: priority is distance, so 0, 1, 2 are the three that
+        // must run and 3, 4, 5 the head of the queue. Lexicographic order would
+        // pick 0, 1, 10.
+        let keys = (0 ..< 12).map { WorkKey("row:\($0)") }
+        var priorities: [WorkKey: Int] = [:]
+        for (index, key) in keys.enumerated() { priorities[key] = index }
+
+        await executor.apply(
+            ReplanDirective(
+                epoch: .initial,
+                plan: plan,
+                admit: keys,
+                cancel: [],
+                retain: [],
+                admissionPriority: priorities
+            )
+        )
+        for _ in 0 ..< 16 { await Task.yield() }
+
+        let state = await executor.snapshot()
+        XCTAssertEqual(
+            state.running,
+            [WorkKey("row:0"), WorkKey("row:1"), WorkKey("row:2")],
+            "the executor started the wrong rows — priority died at the directive boundary"
+        )
+        XCTAssertEqual(
+            Array(state.queued.prefix(3)),
+            [WorkKey("row:3"), WorkKey("row:4"), WorkKey("row:5")],
+            "the queue must be in priority order too, not lexicographic"
+        )
+
+        await executor.cancelAll()
+    }
+
+    /// Work that has not started has cost nothing, so a newly admitted row
+    /// beside the anchor must not wait behind a stale row far from it.
+    func testNewlyAdmittedHigherPriorityWorkJumpsThePendingQueue() async {
+        let runner = BlockingRunner()
+        let executor = WorkExecutor(runner: runner, concurrencyLimit: 1)
+        let plan = CapacityPlan(
+            displayClass: .compact,
+            visibleWindow: 8,
+            prefetchDepth: 0,
+            concurrentDecodes: 1,
+            decodeByteBudget: 1_024
+        )
+
+        let far = (5 ..< 9).map { WorkKey("row:\($0)") }
+        await executor.apply(
+            ReplanDirective(
+                epoch: .initial,
+                plan: plan,
+                admit: far,
+                cancel: [],
+                retain: [],
+                admissionPriority: Dictionary(uniqueKeysWithValues: far.enumerated().map { ($1, 50 + $0) })
+            )
+        )
+        for _ in 0 ..< 8 { await Task.yield() }
+
+        let near = WorkKey("row:1")
+        await executor.apply(
+            ReplanDirective(
+                epoch: Epoch(1),
+                plan: plan,
+                admit: [near],
+                cancel: [],
+                retain: [],
+                admissionPriority: [near: 0]
+            )
+        )
+        for _ in 0 ..< 8 { await Task.yield() }
+
+        let state = await executor.snapshot()
+        XCTAssertEqual(state.queued.first, near, "the nearer row must be next to start")
+        XCTAssertEqual(state.running.count, 1, "and nothing already running was disturbed")
+
+        await executor.cancelAll()
+    }
+
     func testZeroOrNegativeConcurrencyLimitIsClampedRatherThanDeadlocking() async {
         let runner = RecordingRunner(ticks: 1)
         let executor = WorkExecutor(runner: runner, concurrencyLimit: 0)
