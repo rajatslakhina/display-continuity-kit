@@ -41,10 +41,27 @@ public struct WorkLedger: Sendable, Equatable {
     public let capacity: Int
     private var records: [WorkKey: WorkRecord]
 
+    /// How many buckets to pre-allocate, at most.
+    ///
+    /// Deliberately unrelated to `capacity`.
+    private static let reservation = 64
+
     public init(capacity: Int) {
         self.capacity = max(0, capacity)
         self.records = [:]
-        self.records.reserveCapacity(self.capacity)
+        // `capacity` is a *policy* bound, not an expected size, and
+        // `Dictionary.reserveCapacity` allocates eagerly for whatever it is
+        // handed. Reserving the policy bound therefore turns the one type whose
+        // entire premise is "a hard capacity is the only bound that holds under
+        // adversarial input" into a type that aborts at `init` for a large
+        // enough bound — `Int.max` traps inside the stdlib before a single
+        // record is ever admitted.
+        //
+        // The `while records.count > capacity` loop in `admit(_:)` is what
+        // actually enforces the bound; the reservation is only an allocation
+        // hint, so it is capped at a plausible working set and the dictionary
+        // is left to grow on its own.
+        self.records.reserveCapacity(min(self.capacity, Self.reservation))
     }
 
     public var count: Int { records.count }
