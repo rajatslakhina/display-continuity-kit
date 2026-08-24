@@ -251,13 +251,29 @@ public actor ContinuityPlanner: ContinuityPlanning {
         // and `testRealPlannerSurvivesAScrollDuringDeferral` now pin it.
         heldCancellations = heldCancellations.filter { ledger.contains($0) }
 
+        // Carry the priorities forward with the admissions.
+        //
+        // The planner sorts `ordered` by distance from the anchor and admits in
+        // that order so eviction keeps the rows nearest the user. That ordering
+        // is worthless if it stops at the directive boundary: an executor
+        // bounded by `concurrentDecodes` re-derives a start order from whatever
+        // it was handed, and `admit` is sorted lexicographically for
+        // reproducibility. Without this map the executor starts `row:10` before
+        // `row:2` — the planner's whole ranking, undone by string comparison.
+        var admissionPriority: [WorkKey: Int] = [:]
+        admissionPriority.reserveCapacity(admitted.count)
+        for item in toAdmit where admitted.contains(item.key) {
+            admissionPriority[item.key] = item.priority
+        }
+
         return ReplanDirective(
             epoch: epoch,
             plan: plan,
             admit: Array(admitted),
             cancel: Array(allCancellations),
             retain: Array(retained),
-            deferredCancellations: Array(heldCancellations)
+            deferredCancellations: Array(heldCancellations),
+            admissionPriority: admissionPriority
         )
     }
 }
