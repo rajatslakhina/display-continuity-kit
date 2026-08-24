@@ -52,23 +52,59 @@ final class WindowedDemandModelTests: XCTestCase {
         XCTAssertEqual(indices.count, 16, "clamping must not silently shrink the window")
     }
 
-    func testWindowClampsAtTheEndOfTheFeed() {
+    /// The mirror of the start-of-feed case, and for a long time the only one of
+    /// the pair that did not assert a count.
+    ///
+    /// That asymmetry in the assertions hid an asymmetry in the code: the window
+    /// slid correctly off the front of the feed and *truncated* against the
+    /// back, so the bottom of a feed — where pagination pressure is highest —
+    /// silently received a fraction of the planned prefetch.
+    func testWindowSlidesBackAtTheEndOfTheFeedWithoutShrinking() {
         let model = WindowedDemandModel(itemCount: 20)
         let indices = rows(model.demand(for: plan(window: 8, prefetch: 4), anchor: 19, selection: nil))
         XCTAssertEqual(indices.last, 19, "must not walk off the end")
+        XCTAssertEqual(indices.first, 4, "the window slides back rather than truncating")
+        XCTAssertEqual(indices.count, 16, "clamping must not silently shrink the window")
         XCTAssertTrue(indices.allSatisfy { $0 >= 0 && $0 < 20 })
     }
 
-    func testSaturatingAnchorsStayInsideTheFeed() {
+    /// A stale or overshooting anchor must degrade to "the nearest full window",
+    /// never to a single row.
+    func testSaturatingAnchorsStayInsideTheFeedAndStillGetAFullWindow() {
         let model = WindowedDemandModel(itemCount: 40)
-        for anchor in [Int.min, -10_000, -1, 40, 10_000, Int.max] {
+        for anchor in [Int.min, -10_000, -1, 0, 20, 35, 39, 40, 10_000, Int.max] {
             let indices = rows(model.demand(for: plan(window: 8, prefetch: 4), anchor: anchor, selection: nil))
-            XCTAssertFalse(indices.isEmpty, "anchor \(anchor) produced nothing")
+            XCTAssertEqual(
+                indices.count,
+                16,
+                "anchor \(anchor) got \(indices.count) rows instead of a full window"
+            )
             XCTAssertTrue(
                 indices.allSatisfy { $0 >= 0 && $0 < 40 },
                 "anchor \(anchor) demanded out-of-range rows: \(indices)"
             )
         }
+    }
+
+    /// Demand is bounded by a hard ceiling, not only by the feed.
+    ///
+    /// `CapacityPlan` floors its fields but does not cap them, and a feed can be
+    /// millions of rows. One `DemandItem` per row for a saturated window is an
+    /// allocation that ends the process — the same failure `WorkLedger` exists
+    /// to prevent, reintroduced one layer up. "The caller will pass a sane plan"
+    /// is not a bound.
+    func testDemandIsBoundedWhenBothTheFeedAndThePlanAreEnormous() {
+        let model = WindowedDemandModel(itemCount: 50_000_000)
+        let saturated = CapacityPlan(
+            displayClass: .compact,
+            visibleWindow: .max,
+            prefetchDepth: .max,
+            concurrentDecodes: 4,
+            decodeByteBudget: .max
+        )
+        let items = model.demand(for: saturated, anchor: 25_000_000, selection: nil)
+        XCTAssertEqual(items.count, WindowedDemandModel.maximumWindow)
+        XCTAssertEqual(Set(items.map(\.key)).count, items.count, "no duplicate keys")
     }
 
     func testWindowLargerThanTheFeedDemandsTheWholeFeedExactlyOnce() {
