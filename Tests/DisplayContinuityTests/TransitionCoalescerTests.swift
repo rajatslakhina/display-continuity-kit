@@ -116,6 +116,36 @@ final class TransitionCoalescerTests: XCTestCase {
         XCTAssertFalse(coalescer.hasDeferredCancellations)
     }
 
+    /// `.settled` means "issue the held cancellations", and that instruction is
+    /// only correct once.
+    ///
+    /// `ContinuityPlanner` calls `clearDeferral()` on settle, so this was
+    /// invisible in-tree — but `TransitionCoalescer` is a public type with no
+    /// documented obligation to do so, and a second consumer that took the
+    /// decision at face value would have cancelled everything twice.
+    func testSettlingIsReportedOnceAndNotOnEverySubsequentObservation() {
+        var coalescer = TransitionCoalescer(initial: .expanded, window: 500)
+
+        let shrink = coalescer.observe(.compact, at: MonotonicInstant(milliseconds: 0))
+        guard case .shrankDeferringCancellation = shrink else {
+            return XCTFail("expected a deferred shrink, got \(shrink)")
+        }
+        XCTAssertTrue(coalescer.hasDeferredCancellations)
+
+        let settled = coalescer.observe(.compact, at: MonotonicInstant(milliseconds: 500))
+        guard case .settled = settled else { return XCTFail("expected settle, got \(settled)") }
+        XCTAssertFalse(coalescer.hasDeferredCancellations, "settling must clear the deferral itself")
+
+        for time in [600, 700, 5_000] {
+            let again = coalescer.observe(.compact, at: MonotonicInstant(milliseconds: time))
+            XCTAssertEqual(
+                again,
+                .unchanged,
+                "settled twice at \(time)ms — a second consumer would double-cancel"
+            )
+        }
+    }
+
     func testCapacityRankOrdersTheClasses() {
         XCTAssertLessThan(DisplayClass.compact.capacityRank, DisplayClass.expanded.capacityRank)
         XCTAssertTrue(DisplayClass.expanded.showsDetailPane)
