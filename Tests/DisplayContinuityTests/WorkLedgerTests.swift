@@ -7,6 +7,25 @@ final class WorkLedgerTests: XCTestCase {
         WorkRecord(key: WorkKey(name), admittedAtEpoch: Epoch(epoch), priority: priority)
     }
 
+    /// A capacity is a *policy bound*, not an expected size — so constructing a
+    /// ledger with an enormous one must cost nothing until records arrive.
+    ///
+    /// This is the type whose documented premise is "a hard capacity enforced at
+    /// admission time is the only bound that holds under adversarial input", and
+    /// it used to abort at `init` for a large enough bound: `reserveCapacity` on
+    /// the policy value allocated eagerly, dying on `swift_slowAlloc` at 1e8 and
+    /// trapping inside the stdlib's own `Double`-to-`Int` conversion at
+    /// `Int.max`. Reachable from the public `ContinuityPlanner` initialiser.
+    func testAnEnormousCapacityBoundIsNotAnEnormousAllocation() {
+        for capacity in [1_000, 1_000_000, 100_000_000, Int.max / 2, Int.max] {
+            var ledger = WorkLedger(capacity: capacity)
+            XCTAssertEqual(ledger.count, 0, "capacity \(capacity)")
+            ledger.admit(record("a", priority: 0))
+            ledger.admit(record("b", priority: 1))
+            XCTAssertEqual(ledger.count, 2, "capacity \(capacity) must still admit normally")
+        }
+    }
+
     func testAdmitsUpToCapacityWithoutEviction() {
         var ledger = WorkLedger(capacity: 3)
         XCTAssertTrue(ledger.admit(record("a", priority: 0)).isEmpty)
