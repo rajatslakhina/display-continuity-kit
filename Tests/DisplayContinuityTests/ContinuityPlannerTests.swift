@@ -1,0 +1,302 @@
+import XCTest
+@testable import DisplayContinuity
+
+final class ContinuityPlannerTests: XCTestCase {
+
+    private func makePlanner(
+        items: Int = 40,
+        ledgerCapacity: Int = 64,
+        window: Int = 1_200
+    ) -> ContinuityPlanner {
+        ContinuityPlanner(
+            initialViewport: .coverDisplay,
+            policy: AreaProportionalCapacityPolicy(),
+            resolver: MinimumEdgeDisplayClassResolver(),
+            demandModel: WindowedDemandModel(itemCount: items),
+            ledgerCapacity: ledgerCapacity,
+            coalesceWindowMilliseconds: window
+        )
+    }
+
+    private func at(_ milliseconds: Int) -> MonotonicInstant {
+        MonotonicInstant(milliseconds: milliseconds)
+    }
+
+    private let selection = ItemID("i0")
+
+    // MARK: - The headline behaviour
+
+    func testInitialPlanAdmitsTheCompactWindow() async {
+        let planner = makePlanner()
+        let directive = await planner.apply(
+            SurfaceInput(viewport: .coverDisplay, anchor: 0, selection: selection),
+            at: at(0)
+        )
+        XCTAssertEqual(directive.epoch, .initial, "no resize yet, so no new plan generation")
+        XCTAssertEqual(directive.admit.count, 16, "compact admission window")
+        XCTAssertTrue(directive.cancel.isEmpty)
+        XCTAssertTrue(directive.retain.isEmpty, "nothing was in flight to retain")
+        XCTAssertFalse(
+            directive.admit.contains(WorkKey("detail:i0")),
+            "compact has no detail pane, so no detail fetch"
+        )
+    }
+
+    /// The unfold: the detail pane demands content nobody scrolled to, and the
+    /// list work already in flight is *kept*.
+    func testUnfoldRetainsInFlightWorkAndAdmitsOnlyTheDelta() async {
+        let planner = makePlanner()
+        _ = await planner.apply(
+            SurfaceInput(viewport: .coverDisplay, anchor: 0, selection: selection),
+            at: at(0)
+        )
+        let unfold = await planner.apply(
+            SurfaceInput(viewport: .innerDisplay, anchor: 0, selection: selection),
+            at: at(250)
+        )
+
+        XCTAssertEqual(unfold.epoch, Epoch(1), "the world resized, so the plan generation advanced")
+        XCTAssertEqual(unfold.retain.count, 16, "every in-flight row was still wanted — none restarted")
+        XCTAssertEqual(unfold.admit.count, 4, "3 newly visible rows plus the detail pane")
+        XCTAssertTrue(unfold.cancel.isEmpty)
+        XCTAssertTrue(
+            unfold.admit.contains(WorkKey("detail:i0")),
+            "the detail pane's own demand is admitted in the same directive, not as a racing second fetch"
+        )
+        XCTAssertEqual(unfold.plan.displayClass, .expanded)
+    }
+
+    /// The reversal case, which is the entire justification for the deferred
+    /// cancellation policy: unfold, glance, fold back — nothing is refetched.
+    func testFoldAndUnfoldInsideTheWindowRefetchesNothing() async {
+        let planner = makePlanner(window: 1_200)
+        _ = await planner.apply(SurfaceInput(viewport: .coverDisplay, anchor: 0, selection: selection), at: at(0))
+        _ = await planner.apply(SurfaceInput(viewport: .innerDisplay, anchor: 0, selection: selection), at: at(250))
+
+        let fold = await planner.apply(
+            SurfaceInput(viewport: .coverDisplay, anchor: 0, selection: selection),
+            at: at(450)
+        )
+        XCTAssertTrue(fold.cancel.isEmpty, "cancellation is held, not issued")
+        XCTAssertEqual(fold.deferredCancellations.count, 4, "the detail fetch and 3 rows are held")
+        XCTAssertTrue(fold.admit.isEmpty)
+
+        let backUp = await planner.apply(
+            SurfaceInput(viewport: .innerDisplay, anchor: 0, selection: selection),
+            at: at(700)
+        )
+        XCTAssertTrue(backUp.admit.isEmpty, "nothing to restart — it was never cancelled")
+        XCTAssertTrue(backUp.cancel.isEmpty)
+        XCTAssertTrue(backUp.deferredCancellations.isEmpty)
+        XCTAssertEqual(backUp.retain.count, 20, "all 20 units of work survived the round trip")
+    }
+
+    /// And the other half of the contract: if the user does *not* come back,
+    /// the held cancellations must actually be issued.
+    func testHeldCancellationsAreIssuedOnceTheWindowElapses() async {
+        let planner = makePlanner(window: 1_200)
+        _ = await planner.apply(SurfaceInput(viewport: .coverDisplay, anchor: 0, selection: selection), at: at(0))
+        _ = await planner.apply(SurfaceInput(viewport: .innerDisplay, anchor: 0, selection: selection), at: at(250))
+        let fold = await planner.apply(
+            SurfaceInput(viewport: .coverDisplay, anchor: 0, selection: selection),
+            at: at(450)
+        )
+        XCTAssertEqual(fold.deferredCancellations.count, 4)
+
+        let settled = await planner.tick(at: at(450 + 1_200))
+        XCTAssertEqual(settled.cancel.count, 4, "the window elapsed with no reversal, so they go")
+        XCTAssertTrue(settled.deferredCancellations.isEmpty)
+
+        let state = await planner.snapshotState()
+        XCTAssertEqual(state.inFlight.count, 16)
+        XCTAssertFalse(state.inFlight.contains(WorkKey("detail:i0")))
+    }
+
+    func testSelectionlessUnfoldDemandsNoDetailFetch() async {
+        let planner = makePlanner()
+        _ = await planner.apply(SurfaceInput(viewport: .coverDisplay, anchor: 0, selection: nil), at: at(0))
+        let unfold = await planner.apply(
+            SurfaceInput(viewport: .innerDisplay, anchor: 0, selection: nil),
+            at: at(250)
+        )
+        XCTAssertEqual(unfold.admit.count, 3, "rows only — an empty detail pane has nothing to fetch")
+        XCTAssertFalse(unfold.admit.contains(where: { $0.rawValue.hasPrefix("detail:") }))
+    }
+
+    // MARK: - Epoch semantics
+
+    func testScrollingReplansWithinTheSameEpoch() async {
+        let planner = makePlanner()
+        let first = await planner.apply(SurfaceInput(viewport: .coverDisplay, anchor: 0), at: at(0))
+        let scrolled = await planner.apply(SurfaceInput(viewport: .coverDisplay, anchor: 20), at: at(40))
+        XCTAssertEqual(
+            scrolled.epoch,
+            first.epoch,
+            "a scroll changes what is wanted, not the budget — the plan generation is unchanged"
+        )
+        XCTAssertFalse(scrolled.admit.isEmpty, "but it does re-plan")
+        XCTAssertFalse(scrolled.cancel.isEmpty, "rows that scrolled out are cancelled immediately")
+    }
+
+    func testEpochIsMonotonicAcrossAStorm() async {
+        let planner = makePlanner()
+        var epochs: [Epoch] = []
+        for step in 0 ..< 12 {
+            let viewport: Viewport = step.isMultiple(of: 2) ? .innerDisplay : .coverDisplay
+            let directive = await planner.apply(
+                SurfaceInput(viewport: viewport, anchor: 0, selection: selection),
+                at: at(step * 300)
+            )
+            epochs.append(directive.epoch)
+        }
+        for (previous, next) in zip(epochs, epochs.dropFirst()) {
+            XCTAssertLessThanOrEqual(previous, next, "epochs never go backwards")
+        }
+        XCTAssertGreaterThan(epochs.last ?? .initial, .initial)
+    }
+
+    // MARK: - Bounded under pressure
+
+    func testLedgerCapacityIsRespectedAndTheNearestWorkSurvives() async {
+        let planner = makePlanner(items: 200, ledgerCapacity: 10)
+        let directive = await planner.apply(
+            SurfaceInput(viewport: .coverDisplay, anchor: 0, selection: selection),
+            at: at(0)
+        )
+        XCTAssertEqual(directive.admit.count, 10, "capped at ledger capacity, not the 16-row demand")
+        XCTAssertTrue(directive.cancel.isEmpty, "work that never started is not a cancellation")
+
+        let state = await planner.snapshotState()
+        XCTAssertEqual(state.inFlight.count, 10)
+        XCTAssertTrue(state.inFlight.contains(WorkKey("row:0")), "the anchor row is never the eviction victim")
+    }
+
+    func testLongScrollNeverGrowsTheInFlightSetPastItsBound() async {
+        let planner = makePlanner(items: 5_000, ledgerCapacity: 12)
+        for index in stride(from: 0, to: 2_000, by: 7) {
+            _ = await planner.apply(
+                SurfaceInput(viewport: .coverDisplay, anchor: index, selection: selection),
+                at: at(index)
+            )
+            let state = await planner.snapshotState()
+            XCTAssertLessThanOrEqual(state.inFlight.count, 12)
+        }
+    }
+
+    func testPathologicalAnchorsDoNotTrapOrProduceEmptyDemand() async {
+        let planner = makePlanner(items: 40)
+        for anchor in [Int.min, -1, 0, 39, 40, Int.max] {
+            let directive = await planner.apply(
+                SurfaceInput(viewport: .coverDisplay, anchor: anchor, selection: selection),
+                at: at(0)
+            )
+            XCTAssertFalse(
+                directive.plan.admissionWindow <= 0,
+                "an anchor of \(anchor) must not collapse the window"
+            )
+            let state = await planner.snapshotState()
+            XCTAssertFalse(state.inFlight.isEmpty, "anchor \(anchor) produced no work at all")
+        }
+    }
+
+    func testEmptyFeedProducesAnEmptyButValidDirective() async {
+        let planner = makePlanner(items: 0)
+        let directive = await planner.apply(
+            SurfaceInput(viewport: .innerDisplay, anchor: 0, selection: selection),
+            at: at(0)
+        )
+        XCTAssertTrue(directive.admit.isEmpty)
+        XCTAssertTrue(directive.cancel.isEmpty)
+        XCTAssertTrue(directive.isNoOp)
+    }
+
+    // MARK: - Concurrency
+    //
+    // A real concurrent writer, not a sequential loop wearing an async hat:
+    // 64 tasks race the same actor with interleaved fold and unfold
+    // observations at out-of-order instants.
+
+    func testConcurrentObserversCannotBreakTheEpochOrTheBound() async {
+        let planner = makePlanner(items: 500, ledgerCapacity: 24)
+        let observed: [Epoch] = await withTaskGroup(of: Epoch.self) { group in
+            for index in 0 ..< 64 {
+                group.addTask {
+                    let viewport: Viewport = index.isMultiple(of: 3) ? .innerDisplay : .coverDisplay
+                    // Deliberately out-of-order instants: a real clock read on a
+                    // contended actor arrives in whatever order it arrives.
+                    let instant = MonotonicInstant(milliseconds: (index * 977) % 5_000)
+                    let directive = await planner.apply(
+                        SurfaceInput(viewport: viewport, anchor: index * 3, selection: ItemID("i\(index)")),
+                        at: instant
+                    )
+                    return directive.epoch
+                }
+            }
+            var results: [Epoch] = []
+            for await epoch in group { results.append(epoch) }
+            return results
+        }
+
+        XCTAssertEqual(observed.count, 64)
+        let finalState = await planner.snapshotState()
+        XCTAssertLessThanOrEqual(finalState.inFlight.count, 24, "the bound held under contention")
+        for epoch in observed {
+            XCTAssertLessThanOrEqual(
+                epoch,
+                finalState.epoch,
+                "no observer saw an epoch beyond the final one — no torn read"
+            )
+        }
+    }
+
+    // MARK: - Directive shape
+
+    func testDirectiveSetsAreDisjointAndSorted() async {
+        let planner = makePlanner(items: 200, ledgerCapacity: 20)
+        _ = await planner.apply(SurfaceInput(viewport: .coverDisplay, anchor: 0, selection: selection), at: at(0))
+        let directive = await planner.apply(
+            SurfaceInput(viewport: .innerDisplay, anchor: 60, selection: selection),
+            at: at(300)
+        )
+        let admit = Set(directive.admit)
+        let cancel = Set(directive.cancel)
+        let retain = Set(directive.retain)
+        XCTAssertTrue(admit.isDisjoint(with: cancel))
+        XCTAssertTrue(admit.isDisjoint(with: retain))
+        XCTAssertTrue(cancel.isDisjoint(with: retain))
+        XCTAssertEqual(directive.admit, directive.admit.sorted { $0.rawValue < $1.rawValue })
+        XCTAssertEqual(directive.cancel, directive.cancel.sorted { $0.rawValue < $1.rawValue })
+    }
+
+    /// Determinism, asserted across two *independently constructed* planners
+    /// rather than by calling the same one twice — the latter would pass for
+    /// any implementation whose state happened not to change.
+    func testTwoFreshPlannersProduceIdenticalDirectivesForTheSameScript() async {
+        let script: [(Viewport, Int, Int)] = [
+            (.coverDisplay, 0, 0),
+            (.innerDisplay, 0, 250),
+            (.coverDisplay, 5, 500),
+            (.innerDisplay, 5, 700),
+            (.innerDisplay, 40, 2_500)
+        ]
+
+        func run() async -> [ReplanDirective] {
+            let planner = makePlanner(items: 120, ledgerCapacity: 18)
+            var out: [ReplanDirective] = []
+            for (viewport, anchor, time) in script {
+                out.append(
+                    await planner.apply(
+                        SurfaceInput(viewport: viewport, anchor: anchor, selection: selection),
+                        at: at(time)
+                    )
+                )
+            }
+            return out
+        }
+
+        let first = await run()
+        let second = await run()
+        XCTAssertEqual(first, second)
+        XCTAssertFalse(first.allSatisfy(\.isNoOp), "the script does real work, so equality is meaningful")
+    }
+}
