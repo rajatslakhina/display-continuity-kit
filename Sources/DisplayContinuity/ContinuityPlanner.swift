@@ -232,6 +232,25 @@ public actor ContinuityPlanner: ContinuityPlanning {
 
         let allCancellations = issuedCancellations.union(evictionCancellations)
 
+        // A deferred cancellation is a promise to stop something *that is still
+        // running*. Anything no longer in the ledger — issued above, or evicted
+        // during the admission pass — must therefore leave the held set.
+        //
+        // Re-deriving the held set from the ledger rather than subtracting the
+        // two cancellation sets is deliberate: subtraction fixes the cases you
+        // remembered, whereas this restates the invariant, so any future path
+        // that removes a key from the ledger is covered by construction. It
+        // also bounds `heldCancellations` by `ledger.capacity`, which
+        // subtraction alone does not.
+        //
+        // Getting this wrong is not theoretical: an earlier revision pruned the
+        // held set only against the *desired* set, so an evicted key stayed
+        // held, was cancelled once as an eviction and again on settle, and grew
+        // the held set without bound under "fold, then scroll". An independent
+        // review caught it; `testScrollingInsideADeferralWindowStaysConsistent`
+        // and `testRealPlannerSurvivesAScrollDuringDeferral` now pin it.
+        heldCancellations = heldCancellations.filter { ledger.contains($0) }
+
         return ReplanDirective(
             epoch: epoch,
             plan: plan,

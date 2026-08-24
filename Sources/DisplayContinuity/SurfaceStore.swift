@@ -103,8 +103,12 @@ public actor SurfaceStore {
     /// detail pane materialises already populated; on fold it disappears and
     /// the selection is untouched. No handoff, no seeding, nothing to
     /// desynchronise.
+    /// - Note: this is a **pure read**. It does not create, touch or evict a
+    ///   surface. Rendering a pane must never be able to evict someone else's
+    ///   state — a read that writes is how a fold transition ends up dropping
+    ///   the surface the user is about to return to.
     public func projection(for surface: SurfaceID, displayClass: DisplayClass) -> PaneProjection {
-        let state = state(for: surface)
+        let state = states[surface] ?? SurfaceState()
         return PaneProjection(
             listSelection: state.selection,
             detail: displayClass.showsDetailPane ? state.selection : nil,
@@ -112,13 +116,13 @@ public actor SurfaceStore {
         )
     }
 
-    /// Captures a restorable snapshot of a surface.
+    /// Captures a restorable snapshot of a surface. Also a pure read.
     public func snapshot(
         of surface: SurfaceID,
         displayClass: DisplayClass,
         epoch: Epoch
     ) -> ContinuitySnapshot {
-        let state = state(for: surface)
+        let state = states[surface] ?? SurfaceState()
         return ContinuitySnapshot(
             surfaceID: surface,
             selection: state.selection,

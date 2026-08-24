@@ -105,7 +105,15 @@ public final class ContinuityDemoModel {
     }
 
     /// The headline interaction: change the display class and watch the diff.
+    ///
+    /// `displayClass` is updated **synchronously, before the first `await`**.
+    /// Every button in the view spawns an unstructured `Task`, so two quick
+    /// taps run concurrently; updating after the suspension would let the
+    /// second tap read a stale class and resolve to the same target as the
+    /// first, which looks like a dead button.
     public func setDisplayClass(_ newValue: DisplayClass) async {
+        guard newValue != displayClass else { return }
+        displayClass = newValue
         let viewport: Viewport = newValue == .expanded ? .innerDisplay : .coverDisplay
         await replan(viewport: viewport, advancing: 250)
     }
@@ -162,11 +170,20 @@ public final class ContinuityDemoModel {
     // MARK: - Private
 
     private func replan(viewport: Viewport, advancing milliseconds: Int) async {
+        // Advance and capture in one main-actor step, with no `await` between
+        // them. Concurrent callers therefore each get a distinct, increasing
+        // instant; reading `clock` again after the suspension would let two
+        // in-flight re-plans hand the planner out-of-order timestamps.
         clock = clock.advanced(byMilliseconds: milliseconds)
+        let instant = clock
+        let resolved = resolver.displayClass(for: viewport)
         let input = SurfaceInput(viewport: viewport, anchor: anchor, selection: selection)
-        let directive = await planner.apply(input, at: clock)
-        displayClass = resolver.displayClass(for: viewport)
-        projection = await store.projection(for: surface, displayClass: displayClass)
+
+        let directive = await planner.apply(input, at: instant)
+        let projection = await store.projection(for: surface, displayClass: resolved)
+
+        displayClass = resolved
+        self.projection = projection
         absorb(directive)
     }
 

@@ -249,13 +249,54 @@ final class FoldStormDriverTests: XCTestCase {
     func testDriverCatchesAPlannerThatLiesAboutRetention() async {
         let report = await FoldStormDriver().run(storm, against: LyingRetainPlanner())
         XCTAssertFalse(report.passed, "claiming cancelled work is retained must not pass")
+        XCTAssertTrue(
+            report.violations.contains(.retentionLie(WorkKey("row:0"))),
+            "a retention lie must be diagnosed as one, not as a duplicate admission; got: "
+                + report.violations.map(\.description).joined(separator: "; ")
+        )
+    }
+
+    /// The scenario an earlier revision of `ContinuityPlanner` failed: the user
+    /// folds, opening the deferral window, and then keeps scrolling.
+    ///
+    /// Cancellations are held across every one of those re-plans, so any key
+    /// that leaves the ledger while held used to be cancelled twice — once as
+    /// an eviction, once again on settle — and the held set grew without bound.
+    func testRealPlannerSurvivesAScrollDuringDeferral() async {
+        let capacity = 24
+        let planner = ContinuityPlanner(
+            initialViewport: .coverDisplay,
+            demandModel: WindowedDemandModel(itemCount: 5_000),
+            ledgerCapacity: capacity,
+            coalesceWindowMilliseconds: 1_200
+        )
+        let steps: [StormStep] = [
+            .unfold(anchor: 0, selection: selection, after: 200),
+            .fold(anchor: 0, selection: selection, after: 100),
+            .fold(anchor: 40, selection: selection, after: 60),
+            .fold(anchor: 80, selection: selection, after: 60),
+            .fold(anchor: 120, selection: selection, after: 60),
+            .fold(anchor: 160, selection: selection, after: 60),
+            .fold(anchor: 200, selection: selection, after: 60),
+            .fold(anchor: 200, selection: selection, after: 1_500)
+        ]
+        let report = await FoldStormDriver(inFlightBound: capacity).run(steps, against: planner)
+        XCTAssertTrue(
+            report.passed,
+            "violations: " + report.violations.map(\.description).joined(separator: "; ")
+        )
     }
 
     /// Guards the guard: if every mutant somehow passed, the checks above would
     /// still be green individually but the suite would be meaningless. This
     /// asserts the driver discriminates — real passes, all five mutants fail.
     func testDriverDiscriminatesBetweenCorrectAndBrokenPlanners() async {
-        let driver = FoldStormDriver(inFlightBound: 20)
+        // Bound matches the real planner's own `ledgerCapacity` default (64).
+        // An earlier version used 20, which happened to equal the real
+        // planner's exact peak for this storm — one tweak to `rowHeight` or the
+        // reference viewports away from a false red for reasons that have
+        // nothing to do with discrimination.
+        let driver = FoldStormDriver(inFlightBound: 64)
         let realReport = await driver.run(storm, against: realPlanner())
         XCTAssertTrue(realReport.passed)
 

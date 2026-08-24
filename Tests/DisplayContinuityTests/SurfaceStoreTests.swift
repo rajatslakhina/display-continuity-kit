@@ -100,8 +100,15 @@ final class SurfaceStoreTests: XCTestCase {
     }
 
     /// Genuine concurrent writers against the actor, not a sequential loop.
-    func testConcurrentWritersKeepTheStoreBounded() async {
+    ///
+    /// `count <= capacity` alone would be true by construction — eviction runs
+    /// inside every insert. So this also asserts the surviving state is
+    /// *coherent*: every surface still present must hold a selection that some
+    /// writer actually wrote, never a torn or default value.
+    func testConcurrentWritersLeaveTheStoreBoundedAndCoherent() async {
         let store = SurfaceStore(capacity: 6)
+        let written = (0 ..< 128).map { ItemID("i\($0)") }
+
         await withTaskGroup(of: Void.self) { group in
             for index in 0 ..< 128 {
                 group.addTask {
@@ -111,9 +118,57 @@ final class SurfaceStoreTests: XCTestCase {
                 }
             }
         }
+
         let count = await store.count
         XCTAssertLessThanOrEqual(count, 6, "128 racing writers across 20 surfaces stayed inside the bound")
         XCTAssertGreaterThan(count, 0)
+
+        // Every surviving surface must carry a value a writer actually wrote.
+        // A store that dropped a write halfway, or handed back a freshly
+        // defaulted `SurfaceState`, fails here.
+        let writtenSet = Set(written)
+        var survivors = 0
+        for index in 0 ..< 20 {
+            let projection = await store.projection(for: SurfaceID("s\(index)"), displayClass: .compact)
+            guard let selection = projection.listSelection else { continue }
+            survivors += 1
+            XCTAssertTrue(
+                writtenSet.contains(selection),
+                "surface s\(index) held \(selection), which no writer ever wrote"
+            )
+        }
+        XCTAssertEqual(survivors, count, "reads and count disagree about what survived")
+    }
+
+    /// `projection(for:displayClass:)` must be a pure read.
+    ///
+    /// Rendering a pane can never be allowed to evict someone else's surface —
+    /// that is how a fold drops the state the user is about to return to.
+    func testProjectingDoesNotCreateOrEvictSurfaces() async {
+        let store = SurfaceStore(capacity: 2)
+        await store.select(ItemID("a"), in: SurfaceID("kept-1"))
+        await store.select(ItemID("b"), in: SurfaceID("kept-2"))
+        let before = await store.count
+        XCTAssertEqual(before, 2)
+
+        // Project a surface that does not exist, 50 times.
+        for _ in 0 ..< 50 {
+            let projection = await store.projection(for: SurfaceID("never-written"), displayClass: .expanded)
+            XCTAssertNil(projection.detail)
+            XCTAssertTrue(projection.needsDetailPlaceholder)
+        }
+
+        let after = await store.count
+        XCTAssertEqual(after, 2, "projecting minted surfaces")
+
+        let keptOne = await store.projection(for: SurfaceID("kept-1"), displayClass: .compact)
+        XCTAssertEqual(
+            keptOne.listSelection,
+            ItemID("a"),
+            "projecting an absent surface evicted a real one"
+        )
+        let keptTwo = await store.projection(for: SurfaceID("kept-2"), displayClass: .compact)
+        XCTAssertEqual(keptTwo.listSelection, ItemID("b"))
     }
 
     // MARK: - Snapshot integration

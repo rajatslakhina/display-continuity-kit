@@ -184,19 +184,82 @@ final class ContinuityPlannerTests: XCTestCase {
     }
 
     func testPathologicalAnchorsDoNotTrapOrProduceEmptyDemand() async {
-        let planner = makePlanner(items: 40)
+        // Every key the demand model can legally emit for a 40-row feed.
+        let legalRows = Set((0 ..< 40).map { WorkKey("row:\($0)") })
+
         for anchor in [Int.min, -1, 0, 39, 40, Int.max] {
-            let directive = await planner.apply(
+            let planner = makePlanner(items: 40)
+            _ = await planner.apply(
                 SurfaceInput(viewport: .coverDisplay, anchor: anchor, selection: selection),
                 at: at(0)
             )
-            XCTAssertFalse(
-                directive.plan.admissionWindow <= 0,
-                "an anchor of \(anchor) must not collapse the window"
+            let state = await planner.snapshotState()
+
+            XCTAssertFalse(state.inFlight.isEmpty, "anchor \(anchor) produced no work at all")
+            // The real assertion: a saturating anchor must not walk the window
+            // off the end of the feed. `Int.max` clamping to an empty or
+            // out-of-range window is exactly the bug this guards.
+            let outOfRange = Set(state.inFlight).subtracting(legalRows)
+                .filter { !$0.rawValue.hasPrefix("detail:") }
+            XCTAssertTrue(
+                outOfRange.isEmpty,
+                "anchor \(anchor) demanded rows outside 0..<40: \(outOfRange)"
+            )
+        }
+    }
+
+    // MARK: - Re-planning inside an open deferral window
+    //
+    // The path that is easy to get wrong: the user folds (opening the deferral
+    // window) and then keeps scrolling on the cover display. Each scroll
+    // re-plans while cancellations are still being held.
+
+    func testScrollingInsideADeferralWindowStaysConsistent() async {
+        let capacity = 24
+        let planner = makePlanner(items: 5_000, ledgerCapacity: capacity, window: 1_200)
+
+        _ = await planner.apply(SurfaceInput(viewport: .innerDisplay, anchor: 0, selection: selection), at: at(0))
+        _ = await planner.apply(SurfaceInput(viewport: .coverDisplay, anchor: 0, selection: selection), at: at(200))
+
+        // Six scrolls, all inside the 1,200 ms window.
+        for (step, anchor) in [40, 80, 120, 160, 200, 240].enumerated() {
+            let directive = await planner.apply(
+                SurfaceInput(viewport: .coverDisplay, anchor: anchor, selection: selection),
+                at: at(260 + step * 60)
             )
             let state = await planner.snapshotState()
-            XCTAssertFalse(state.inFlight.isEmpty, "anchor \(anchor) produced no work at all")
+
+            // Held cancellations are a promise to stop work that is *still
+            // running*. Anything held must therefore still be in the ledger.
+            let heldButNotInFlight = Set(directive.deferredCancellations)
+                .subtracting(state.inFlight)
+            XCTAssertTrue(
+                heldButNotInFlight.isEmpty,
+                "held a cancellation for work that is not in flight: \(heldButNotInFlight)"
+            )
+            // …which also bounds the held set by the ledger's capacity. Without
+            // this the held set is the one collection with no bound of its own.
+            XCTAssertLessThanOrEqual(
+                directive.deferredCancellations.count,
+                capacity,
+                "the held set grew past the ledger it is supposed to describe"
+            )
+            // And a key can never be both "stop this now" and "we are holding
+            // this pending reversal" in the same directive.
+            XCTAssertTrue(
+                Set(directive.cancel).isDisjoint(with: Set(directive.deferredCancellations)),
+                "a key was simultaneously cancelled and held"
+            )
         }
+
+        // Settling must not re-cancel anything that already left the ledger.
+        let settled = await planner.tick(at: at(3_000))
+        let state = await planner.snapshotState()
+        XCTAssertTrue(
+            Set(settled.cancel).isDisjoint(with: Set(state.inFlight)),
+            "settle cancelled work that is still in flight"
+        )
+        XCTAssertTrue(settled.deferredCancellations.isEmpty, "settling must clear the held set")
     }
 
     func testEmptyFeedProducesAnEmptyButValidDirective() async {
@@ -216,37 +279,70 @@ final class ContinuityPlannerTests: XCTestCase {
     // 64 tasks race the same actor with interleaved fold and unfold
     // observations at out-of-order instants.
 
-    func testConcurrentObserversCannotBreakTheEpochOrTheBound() async {
-        let planner = makePlanner(items: 500, ledgerCapacity: 24)
-        let observed: [Epoch] = await withTaskGroup(of: Epoch.self) { group in
+    /// A genuine concurrent-writer test: 64 tasks race the same actor with
+    /// interleaved fold/unfold observations at out-of-order instants.
+    ///
+    /// The assertions are deliberately *per directive*, not on the final state.
+    /// "The final epoch is the maximum epoch" and "the ledger is inside its own
+    /// capacity" are true by construction and would pass for a planner that
+    /// never bumps the epoch at all. What is not true by construction is that
+    /// every directive a racing caller receives is internally coherent.
+    func testConcurrentObserversAlwaysReceiveCoherentDirectives() async {
+        let capacity = 24
+        let planner = makePlanner(items: 500, ledgerCapacity: capacity)
+
+        let directives: [ReplanDirective] = await withTaskGroup(of: ReplanDirective.self) { group in
             for index in 0 ..< 64 {
                 group.addTask {
                     let viewport: Viewport = index.isMultiple(of: 3) ? .innerDisplay : .coverDisplay
-                    // Deliberately out-of-order instants: a real clock read on a
-                    // contended actor arrives in whatever order it arrives.
+                    // Out-of-order instants: a real clock read on a contended
+                    // actor arrives in whatever order it arrives.
                     let instant = MonotonicInstant(milliseconds: (index * 977) % 5_000)
-                    let directive = await planner.apply(
+                    return await planner.apply(
                         SurfaceInput(viewport: viewport, anchor: index * 3, selection: ItemID("i\(index)")),
                         at: instant
                     )
-                    return directive.epoch
                 }
             }
-            var results: [Epoch] = []
-            for await epoch in group { results.append(epoch) }
+            var results: [ReplanDirective] = []
+            for await directive in group { results.append(directive) }
             return results
         }
 
-        XCTAssertEqual(observed.count, 64)
-        let finalState = await planner.snapshotState()
-        XCTAssertLessThanOrEqual(finalState.inFlight.count, 24, "the bound held under contention")
-        for epoch in observed {
+        XCTAssertEqual(directives.count, 64)
+
+        for (index, directive) in directives.enumerated() {
+            let admit = Set(directive.admit)
+            let cancel = Set(directive.cancel)
+            let retain = Set(directive.retain)
+            let held = Set(directive.deferredCancellations)
+
+            XCTAssertTrue(admit.isDisjoint(with: cancel), "directive \(index): admit ∩ cancel")
+            XCTAssertTrue(admit.isDisjoint(with: retain), "directive \(index): admit ∩ retain")
+            XCTAssertTrue(cancel.isDisjoint(with: retain), "directive \(index): cancel ∩ retain")
+            XCTAssertTrue(cancel.isDisjoint(with: held), "directive \(index): cancel ∩ held")
             XCTAssertLessThanOrEqual(
-                epoch,
-                finalState.epoch,
-                "no observer saw an epoch beyond the final one — no torn read"
+                admit.count + retain.count,
+                capacity,
+                "directive \(index) described more live work than the ledger can hold"
+            )
+            XCTAssertLessThanOrEqual(
+                held.count,
+                capacity,
+                "directive \(index) held more cancellations than there is work to cancel"
             )
         }
+
+        // At least one caller must have observed a real re-plan, or the test
+        // proved nothing about contention.
+        XCTAssertTrue(
+            directives.contains { !$0.isNoOp },
+            "no directive did any work — the race never exercised the planner"
+        )
+        XCTAssertTrue(
+            directives.contains { $0.epoch > .initial },
+            "the epoch never advanced, so no display-class change was observed"
+        )
     }
 
     // MARK: - Directive shape

@@ -41,7 +41,8 @@ This is deliberately a **system design** problem *and* an **architecture** probl
 | `TransitionCoalescer` | Collapses a fold/unfold storm. Growth applies immediately; shrink defers its cancellations. |
 | `WorkLedger` | The bounded in-flight set, with priority eviction. |
 | `Epoch` | A monotonic plan generation stamped onto every unit of work, so a late response from a superseded plan is *identifiable* rather than indistinguishable. |
-| `FoldStormDriver` | Replays scripted transition sequences with time supplied by fiat and checks five continuity invariants. |
+| `WorkExecutor` / `WorkRunning` | The reference consumer. Turns `admit` into real running `Task`s, `cancel` into real cancellation, and `retain` into **nothing at all**. Enforces `concurrentDecodes` as a hard limit with a priority queue behind it. |
+| `FoldStormDriver` | Replays scripted transition sequences with time supplied by fiat and checks six continuity invariants. |
 
 ### Micro — who owns the state a disappearing pane was holding
 
@@ -58,17 +59,21 @@ This is deliberately a **system design** problem *and* an **architecture** probl
 
 ### 1. A re-plan is a diff, not a new state
 
-`ReplanDirective` has three fields, and `retain` is the one that matters:
+`ReplanDirective` carries six fields (`epoch`, `plan`, `admit`, `cancel`, `retain`, `deferredCancellations`). Three of them are the instruction, and `retain` is the one that matters:
 
 ```swift
 public struct ReplanDirective {
     public let admit: [WorkKey]    // start these
     public let cancel: [WorkKey]   // stop these
     public let retain: [WorkKey]   // already in flight and still wanted — do NOT restart
+    // …plus `epoch`, `plan`, and `deferredCancellations` (informational:
+    //    cancellations computed but held pending a possible reversal)
 }
 ```
 
 **Rejected:** "here is the new desired set, go make it so." Simpler API, and the executor has no way to tell which of those requests are already in the air. That *is* the duplicated-fetch bug, expressed as an interface.
+
+`WorkExecutor` is the reference consumer, and it exists so this is a measured claim rather than a rhetorical one. `WorkExecutorTests` drives the real planner through a fold storm, hands every directive to the real executor, and asserts that **no unit of work is ever started twice** — then does it again with a deliberately naive executor that folds `retain` into `admit`, and asserts that one *does* restart work. Without the negative control, the first test would only prove the planner never emitted a duplicate, not that honouring `retain` matters.
 
 ### 2. Growth and shrink are handled asymmetrically
 
@@ -79,11 +84,15 @@ public struct ReplanDirective {
 
 **Rejected:** cancel eagerly and let an HTTP cache make the refetch cheap. That assumes the work is a cacheable `GET`. Decodes, database reads and on-device inference are none of those things.
 
-### 3. Prefetch depth scales *sub-linearly* with area; decode budget scales linearly
+### 3. Prefetch depth scales *sub-linearly* with area; the decode budget tracks the plan, not the glass
 
-The unfolded surface shows roughly twice the rows, but scroll *velocity* does not double — so doubling prefetch buys latency the user never perceives at twice the network cost. Prefetch tracks `√area`; the decode budget tracks `area`, because what is resident genuinely does double.
+Unfolding roughly doubles the viewport area but only widens the primary list by about 15% — the extra room goes to the detail pane, not to more rows. And scroll *velocity* does not change at all. So scaling prefetch with area would buy latency the user never perceives at a real network cost. Prefetch tracks `√area`: 4 rows on the cover display, 5 on the inner one.
 
-**Rejected:** linear scaling for both. Simpler, and measurably wasteful. `CapacityPolicyTests.testPrefetchScalesSubLinearlyWithArea` fails if anyone "simplifies" it back.
+The decode budget is derived from **admitted rows**, not area: `(visibleWindow + prefetchDepth) × bytesPerRow`, so it moves with the plan.
+
+**Rejected:** scaling the decode budget by raw viewport area. The inner display is 1.94× the area but the planner admits only 1.19× the rows, so an area-scaled budget would authorise roughly 60% more resident bytes than the plan can ever produce. A ceiling that never binds is not a budget.
+
+`CapacityPolicyTests.testPrefetchScalesSubLinearlyWithArea` and `testDecodeBudgetTracksAdmittedRowsAndNotArea` both fail if anyone "simplifies" this back — the latter asserts the exact identity and that the budget ratio stays *below* the area ratio, rather than the vacuous "it went up".
 
 ### 4. Concurrency is served by having no suspension points, not by locks
 
@@ -111,9 +120,9 @@ All of it funnels through one `Saturating` type, and every ceiling is derived fr
 
 ## The test suite is designed to be able to fail
 
-**100 tests across 8 suites.** The ones worth looking at are in `FoldStormDriverTests`.
+**122 tests across 10 suites.** The ones worth looking at are in `FoldStormDriverTests`.
 
-`FoldStormDriver` checks five invariants — no duplicated fetches, no cancel-without-admission, no admit-and-cancel in one directive, no epoch regression, no unbounded growth. An invariant checker that has only ever been run against a correct implementation has not been shown to catch anything, so the suite ships **five deliberately broken planners** and asserts the driver goes red for each:
+`FoldStormDriver` checks six invariants — no duplicated fetches, no cancel-without-admission, no admit-and-cancel in one directive, no retention lie, no epoch regression, no unbounded growth (of either the in-flight set or the held-cancellation set). An invariant checker that has only ever been run against a correct implementation has not been shown to catch anything, so the suite ships **five deliberately broken planners** and asserts the driver goes red for each:
 
 | Mutant | Breaks |
 |---|---|
@@ -125,9 +134,17 @@ All of it funnels through one `Saturating` type, and every ceiling is derived fr
 
 `testDriverDiscriminatesBetweenCorrectAndBrokenPlanners` asserts the real planner passes **and** all five mutants fail, in one test. Gutting the driver's checks turns that red.
 
-This is not decoration. The harness caught a genuine bug in `ContinuityPlanner` during development that only appeared under ledger pressure: a key evicted partway through an admission pass was re-admitted later in the same pass, landing in both `cancel` and `admit`. The fix — freezing the admission list before the loop — is commented at the site.
+This is not decoration. **The harness and an independent review have each caught a real bug in `ContinuityPlanner`,** and both fixes are commented at the site:
 
-Other things the suite deliberately does *not* do: no test calls a pure function twice and asserts the results match; no test asserts a value lies inside a range the implementation computed by clamping. Determinism is asserted across two **independently constructed** planners running the same script. Concurrency tests use real `TaskGroup` writers racing the actor — 64 tasks with out-of-order clock reads — not a sequential loop wearing an `async` hat.
+1. A key evicted partway through an admission pass was re-admitted later in the same pass, landing in both `cancel` and `admit`. Only reproduced under ledger pressure. Fix: freeze the admission list before the loop.
+2. The held-cancellation set was pruned only against the *desired* set, so a key evicted while held was cancelled twice — once as an eviction, again on settle — and the held set grew without bound. The reproducer is mundane: **fold the phone, then keep scrolling.** Fix: re-derive the held set from the ledger, which also bounds it by `ledgerCapacity`. `testScrollingInsideADeferralWindowStaysConsistent` and `testRealPlannerSurvivesAScrollDuringDeferral` pin it — remove the one-line fix and they produce 18 failures, including `the held set grew past the ledger it is supposed to describe (35 > 24)`.
+
+Other things the suite deliberately does *not* do:
+
+- **No test calls a pure function twice and asserts the results match.** The encoder test asserts the emitted JSON keys are in *ascending order* — a property that disappears if `.sortedKeys` is removed — rather than that a pure function is deterministic within one process, which holds either way.
+- **No test asserts a value lies inside a range the implementation computed by clamping.** The pathological-anchor test asserts the demanded rows fall inside the *feed*, which a saturating-anchor bug violates.
+- **Concurrency assertions are per-directive, not on final state.** "The final epoch is the maximum epoch" is true by construction and would pass for a planner that never advances the epoch. What is not true by construction is that every directive a racing caller receives is internally coherent — disjoint sets, bounded counts — so that is what is asserted, across 64 real `TaskGroup` writers with out-of-order clock reads.
+- Determinism is asserted across two **independently constructed** planners running the same script, not by calling one planner twice.
 
 ---
 
@@ -156,6 +173,13 @@ for key in directive.admit  { executor.start(key, epoch: directive.epoch) }
 // directive.retain is the work you did NOT have to touch.
 ```
 
+Or hand it to the reference executor, which does exactly that and enforces `concurrentDecodes`:
+
+```swift
+let executor = WorkExecutor(runner: myFetcher)   // myFetcher: some WorkRunning
+await executor.apply(directive)
+```
+
 Verify your own integration under a storm:
 
 ```swift
@@ -175,15 +199,19 @@ Stated precisely, because "it builds" and "it runs" are different claims and onl
 | Check | Status |
 |---|---|
 | `swift build -Xswiftc -warnings-as-errors`, from a deleted `.build` | **Passed**, 0 warnings |
-| `swift test -Xswiftc -warnings-as-errors` | **Passed** — 100 tests, 0 failures, 8 suites |
+| `swift test -Xswiftc -warnings-as-errors` | **Passed** — 122 tests, 0 failures, 10 suites |
 | Toolchain used locally | Swift 6.0.3, `aarch64-unknown-linux-gnu` |
-| Linux CI (`swift:6.0` container) | See [Actions](../../actions) — builds and tests the core with warnings as errors |
-| iOS CI (`macos-15`) | See [Actions](../../actions) — compiles `DisplayContinuityUI` for `generic/platform=iOS Simulator` |
-| SwiftUI layer executed on a Simulator | **Not in this repo.** See the demo app below. |
+| Linux CI (`swift:6.0` container) | **Green** — see [Actions](../../actions). Builds and tests the core with warnings as errors |
+| iOS CI (`macos-15`) | **Green** — see [Actions](../../actions). Compiles `DisplayContinuityUI` for `generic/platform=iOS Simulator` |
+| SwiftUI layer **executed** on a Simulator | **No.** See below — this is a separate claim from "it compiles for a Simulator destination", and only the compile claim was earned. |
 
-The core is platform-agnostic Swift by design, precisely so it can be fully tested headlessly rather than only eyeballed.
+The core is platform-agnostic Swift by design, precisely so it can be fully tested headlessly rather than only eyeballed. The SwiftUI layer is compiled by CI for an iOS Simulator destination, but **nothing here was ever launched and interacted with on a running Simulator.** The automated run that produced this repo requested Simulator access three times and was refused each time with:
 
-**Demo app:** (added after the companion repo is pushed — see below)
+> Computer-use access to "Simulator", "Xcode 26.3" can't be approved during a scheduled run. To grant it, send a message in this conversation (the approval card will appear), or add the app to the scheduled task's settings.
+
+Consequently there are **no screenshots** anywhere in either repo, and no mockup stands in for one.
+
+**Demo app:** [rajatslakhina/display-continuity-demo-app](https://github.com/rajatslakhina/display-continuity-demo-app) — a SwiftUI app that consumes this package as a **version-pinned remote** dependency (`upToNextMajorVersion` from `1.0.0`), not a local path. Its CI job resolves this package from GitHub on a clean `macos-15` runner with nothing cached and compiles the app against it; that repo's Actions tab is the record of whether it did. That is the cheapest honest proof that the published package works as a dependency — and it is a *compile* proof, not a run proof.
 
 ---
 

@@ -114,7 +114,11 @@ public struct WindowedDemandModel: DemandModel {
         let upper = Saturating.clamp(rawUpper, lower: lower, upper: itemCount)
 
         var items: [DemandItem] = []
-        items.reserveCapacity(upper - lower + 1)
+        // Saturating: `upper` and `lower` are both derived from a clamped
+        // anchor, but `CapacityPlan` only floors its fields — a plan built
+        // through the public initialiser with `visibleWindow: .max` yields a
+        // saturated `admissionWindow`, and a plain `+` here would trap.
+        items.reserveCapacity(Saturating.add(Saturating.subtract(upper, lower), 1))
 
         // `lower ..< upper` is well-formed: `upper` is clamped to be >= `lower`.
         for index in lower ..< upper {

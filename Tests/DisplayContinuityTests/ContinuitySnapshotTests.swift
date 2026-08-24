@@ -61,10 +61,45 @@ final class ContinuitySnapshotTests: XCTestCase {
         XCTAssertNil(decoded.selection)
     }
 
-    func testEncodingIsStableSoSnapshotsCompareByBytes() throws {
-        let first = try ContinuitySnapshotCoder.encode(makeSnapshot())
-        let second = try ContinuitySnapshotCoder.encode(makeSnapshot())
-        XCTAssertEqual(first, second, "sorted keys make the encoded form canonical")
+    /// Asserts the *property* `.sortedKeys` provides, not that a pure function
+    /// is deterministic within one process.
+    ///
+    /// Encoding the same value twice in one run matches regardless of
+    /// `outputFormatting`, so that assertion would pass with the option
+    /// deleted. Checking that the emitted keys are in ascending order does not:
+    /// remove `encoder.outputFormatting = [.sortedKeys]` and this goes red.
+    func testEncodedKeysAreSortedSoTheFormIsCanonicalAcrossBuilds() throws {
+        let data = try ContinuitySnapshotCoder.encode(makeSnapshot())
+        let json = try XCTUnwrap(String(data: data, encoding: .utf8))
+
+        // Top-level keys, in the order the encoder emitted them.
+        var emitted: [String] = []
+        var depth = 0
+        var index = json.startIndex
+        while index < json.endIndex {
+            let character = json[index]
+            if character == "{" || character == "[" { depth += 1 }
+            if character == "}" || character == "]" { depth -= 1 }
+            if character == "\"", depth == 1 {
+                let after = json.index(after: index)
+                if let close = json[after...].firstIndex(of: "\"") {
+                    let candidate = String(json[after ..< close])
+                    let next = json.index(after: close)
+                    if next < json.endIndex, json[next] == ":" {
+                        emitted.append(candidate)
+                    }
+                    index = close
+                }
+            }
+            index = json.index(after: index)
+        }
+
+        XCTAssertGreaterThan(emitted.count, 1, "there must be keys to compare")
+        XCTAssertEqual(
+            emitted,
+            emitted.sorted(),
+            "keys must be emitted in ascending order; got \(emitted)"
+        )
     }
 
     // MARK: - Rule 1 — unknown fields are tolerated

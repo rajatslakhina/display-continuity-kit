@@ -77,8 +77,14 @@ public protocol CapacityPolicy: Sendable {
 ///    buy latency the user never perceives at twice the network cost. Rejected
 ///    alternative: linear scaling, which is simpler and measurably wasteful.
 ///
-/// 2. **The decode budget scales linearly with area**, because it is bounded by
-///    what is actually on screen, and what is on screen genuinely doubles.
+/// 2. **The decode budget is derived from admitted rows, not from area.**
+///    Resident decoded bytes are bounded by the work the planner actually
+///    admits — `(visibleWindow + prefetchDepth) × bytesPerRow` — so the budget
+///    moves with the plan rather than with the glass. Rejected alternative:
+///    scaling it by raw viewport area. The inner display is ~1.94× the area but
+///    the planner only admits ~1.19× the rows, so an area-scaled budget would
+///    authorise roughly 60% more resident bytes than the plan can ever produce.
+///    A ceiling that never binds is not a budget.
 ///
 /// 3. **`concurrentDecodes` is capped low** (`6`). Beyond a handful, decodes
 ///    stop being parallel and start being memory pressure — the unfold already

@@ -1,0 +1,308 @@
+import XCTest
+@testable import DisplayContinuity
+
+/// Counts how many times each unit of work actually *started*, and how many
+/// times a started unit observed cancellation.
+private actor RecordingRunner: WorkRunning {
+    private(set) var starts: [WorkKey: Int] = [:]
+    private(set) var completions: [WorkKey: Int] = [:]
+    private(set) var cancellations: [WorkKey: Int] = [:]
+    /// Number of iterations each unit of work spends before finishing.
+    private let ticks: Int
+
+    init(ticks: Int = 3) { self.ticks = ticks }
+
+    func run(_ key: WorkKey) async {
+        starts[key, default: 0] += 1
+        for _ in 0 ..< ticks {
+            if Task.isCancelled {
+                cancellations[key, default: 0] += 1
+                return
+            }
+            await Task.yield()
+        }
+        if Task.isCancelled {
+            cancellations[key, default: 0] += 1
+            return
+        }
+        completions[key, default: 0] += 1
+    }
+
+    func startCount(_ key: WorkKey) -> Int { starts[key] ?? 0 }
+    func totalStarts() -> Int { starts.values.reduce(0, +) }
+    func distinctStarted() -> Int { starts.keys.count }
+    func maxStartsForAnyKey() -> Int { starts.values.max() ?? 0 }
+}
+
+/// Runs forever until cancelled. Used to prove the concurrency limit binds.
+private actor BlockingRunner: WorkRunning {
+    private(set) var started: Set<WorkKey> = []
+
+    func run(_ key: WorkKey) async {
+        started.insert(key)
+        while !Task.isCancelled {
+            await Task.yield()
+        }
+    }
+
+    func startedKeys() -> Set<WorkKey> { started }
+}
+
+/// The point of `ReplanDirective.retain` is that *something downstream does
+/// nothing with it*. These tests prove that end to end: they drive the real
+/// planner, hand every directive to the real executor, and count starts.
+final class WorkExecutorTests: XCTestCase {
+
+    private let selection = ItemID("i0")
+
+    private func makePlanner(items: Int = 40, capacity: Int = 64) -> ContinuityPlanner {
+        ContinuityPlanner(
+            initialViewport: .coverDisplay,
+            demandModel: WindowedDemandModel(itemCount: items),
+            ledgerCapacity: capacity,
+            coalesceWindowMilliseconds: 1_200
+        )
+    }
+
+    private func at(_ ms: Int) -> MonotonicInstant { MonotonicInstant(milliseconds: ms) }
+
+    /// The headline claim, measured rather than asserted: across a fold storm,
+    /// no unit of work is ever *started* twice.
+    func testNoUnitOfWorkIsEverStartedTwiceAcrossAFoldStorm() async {
+        let runner = RecordingRunner(ticks: 2)
+        let executor = WorkExecutor(runner: runner, concurrencyLimit: 8)
+        let planner = makePlanner()
+
+        let script: [(Viewport, Int)] = [
+            (.coverDisplay, 0), (.innerDisplay, 250), (.coverDisplay, 430),
+            (.innerDisplay, 580), (.coverDisplay, 700), (.innerDisplay, 790)
+        ]
+        for (viewport, time) in script {
+            let directive = await planner.apply(
+                SurfaceInput(viewport: viewport, anchor: 0, selection: selection),
+                at: at(time)
+            )
+            await executor.apply(directive)
+            // Let the runner make progress between transitions.
+            for _ in 0 ..< 8 { await Task.yield() }
+        }
+
+        let worst = await runner.maxStartsForAnyKey()
+        XCTAssertEqual(worst, 1, "some unit of work was started more than once across the storm")
+
+        let distinct = await runner.distinctStarted()
+        XCTAssertGreaterThanOrEqual(distinct, 16, "the storm must actually have done work")
+
+        await executor.cancelAll()
+    }
+
+    /// The negative control. An executor that treats `retain` as `admit` — the
+    /// exact mistake `ReplanDirective` documents — restarts work, and this test
+    /// asserts that it does. Without this, the test above proves only that the
+    /// planner never emitted a duplicate, not that honouring `retain` matters.
+    func testTreatingRetainAsAdmitDemonstrablyRestartsWork() async {
+        let runner = RecordingRunner(ticks: 2)
+        let executor = WorkExecutor(runner: runner, concurrencyLimit: 8)
+        let planner = makePlanner()
+
+        let script: [(Viewport, Int)] = [
+            (.coverDisplay, 0), (.innerDisplay, 250), (.coverDisplay, 430), (.innerDisplay, 580)
+        ]
+        for (viewport, time) in script {
+            let directive = await planner.apply(
+                SurfaceInput(viewport: viewport, anchor: 0, selection: selection),
+                at: at(time)
+            )
+            // The bug, expressed as a directive: fold `retain` into `admit`.
+            let naive = ReplanDirective(
+                epoch: directive.epoch,
+                plan: directive.plan,
+                admit: directive.admit + directive.retain,
+                cancel: directive.cancel,
+                retain: []
+            )
+            await executor.apply(naive)
+            for _ in 0 ..< 8 { await Task.yield() }
+        }
+
+        let worst = await runner.maxStartsForAnyKey()
+        XCTAssertGreaterThan(
+            worst,
+            1,
+            "the naive executor must visibly restart work, or the correct one proves nothing"
+        )
+        await executor.cancelAll()
+    }
+
+    /// `concurrentDecodes` is a real limit, not advisory.
+    func testConcurrencyLimitBindsAndQueuesTheRest() async {
+        let runner = BlockingRunner()
+        let executor = WorkExecutor(runner: runner, concurrencyLimit: 3)
+
+        let plan = CapacityPlan(
+            displayClass: .compact,
+            visibleWindow: 10,
+            prefetchDepth: 0,
+            concurrentDecodes: 3,
+            decodeByteBudget: 1_024
+        )
+        let keys = (0 ..< 10).map { WorkKey("row:\($0)") }
+        await executor.apply(
+            ReplanDirective(epoch: .initial, plan: plan, admit: keys, cancel: [], retain: [])
+        )
+        for _ in 0 ..< 16 { await Task.yield() }
+
+        let state = await executor.snapshot()
+        XCTAssertEqual(state.running.count, 3, "the limit must bind")
+        XCTAssertEqual(state.queued.count, 7, "the rest must queue, not start")
+
+        let started = await runner.startedKeys()
+        XCTAssertEqual(started.count, 3, "queued work must not have run")
+
+        await executor.cancelAll()
+    }
+
+    /// Work cancelled before it ever started costs nothing and must not be
+    /// counted as a cancellation — otherwise the metric measures the queue
+    /// rather than wasted effort.
+    func testCancellingQueuedWorkIsFreeAndNotCountedAsACancellation() async {
+        let runner = BlockingRunner()
+        let executor = WorkExecutor(runner: runner, concurrencyLimit: 1)
+
+        let plan = CapacityPlan(
+            displayClass: .compact,
+            visibleWindow: 4,
+            prefetchDepth: 0,
+            concurrentDecodes: 1,
+            decodeByteBudget: 1_024
+        )
+        let keys = (0 ..< 4).map { WorkKey("row:\($0)") }
+        await executor.apply(
+            ReplanDirective(epoch: .initial, plan: plan, admit: keys, cancel: [], retain: [])
+        )
+        for _ in 0 ..< 8 { await Task.yield() }
+
+        // Cancel the three that never started.
+        await executor.apply(
+            ReplanDirective(
+                epoch: Epoch(1),
+                plan: plan,
+                admit: [],
+                cancel: Array(keys.dropFirst()),
+                retain: [keys[0]]
+            )
+        )
+        for _ in 0 ..< 8 { await Task.yield() }
+
+        let state = await executor.snapshot()
+        XCTAssertEqual(state.cancelCount, 0, "queued-but-unstarted work costs nothing to drop")
+        XCTAssertEqual(state.queued.count, 0)
+        XCTAssertEqual(state.running.count, 1, "the one that started keeps running")
+
+        await executor.cancelAll()
+    }
+
+    func testCancellationIsObservedByRunningWork() async {
+        let runner = RecordingRunner(ticks: 10_000)
+        let executor = WorkExecutor(runner: runner, concurrencyLimit: 2)
+        let plan = CapacityPlan(
+            displayClass: .compact,
+            visibleWindow: 2,
+            prefetchDepth: 0,
+            concurrentDecodes: 2,
+            decodeByteBudget: 1_024
+        )
+        let key = WorkKey("row:0")
+        await executor.apply(
+            ReplanDirective(epoch: .initial, plan: plan, admit: [key], cancel: [], retain: [])
+        )
+        for _ in 0 ..< 8 { await Task.yield() }
+        let firstStarts = await runner.startCount(key)
+        XCTAssertEqual(firstStarts, 1)
+
+        await executor.apply(
+            ReplanDirective(epoch: Epoch(1), plan: plan, admit: [], cancel: [key], retain: [])
+        )
+        for _ in 0 ..< 64 { await Task.yield() }
+
+        let state = await executor.snapshot()
+        XCTAssertEqual(state.cancelCount, 1, "cancelling running work is a real cancellation")
+        XCTAssertFalse(state.running.contains(key))
+    }
+
+    func testReAdmittingSomethingAlreadyRunningIsANoOp() async {
+        let runner = BlockingRunner()
+        let executor = WorkExecutor(runner: runner, concurrencyLimit: 4)
+        let plan = CapacityPlan(
+            displayClass: .compact,
+            visibleWindow: 2,
+            prefetchDepth: 0,
+            concurrentDecodes: 4,
+            decodeByteBudget: 1_024
+        )
+        let key = WorkKey("row:0")
+        for epoch in 0 ..< 5 {
+            await executor.apply(
+                ReplanDirective(epoch: Epoch(epoch), plan: plan, admit: [key], cancel: [], retain: [])
+            )
+            for _ in 0 ..< 4 { await Task.yield() }
+        }
+        let state = await executor.snapshot()
+        XCTAssertEqual(state.startCounts[key], 1, "a defensive re-admit must not restart running work")
+        await executor.cancelAll()
+    }
+
+    func testCancelAllStopsEverything() async {
+        let runner = BlockingRunner()
+        let executor = WorkExecutor(runner: runner, concurrencyLimit: 4)
+        let plan = CapacityPlan(
+            displayClass: .compact,
+            visibleWindow: 8,
+            prefetchDepth: 0,
+            concurrentDecodes: 4,
+            decodeByteBudget: 1_024
+        )
+        await executor.apply(
+            ReplanDirective(
+                epoch: .initial,
+                plan: plan,
+                admit: (0 ..< 8).map { WorkKey("row:\($0)") },
+                cancel: [],
+                retain: []
+            )
+        )
+        for _ in 0 ..< 8 { await Task.yield() }
+        await executor.cancelAll()
+        for _ in 0 ..< 16 { await Task.yield() }
+
+        let state = await executor.snapshot()
+        XCTAssertTrue(state.running.isEmpty)
+        XCTAssertTrue(state.queued.isEmpty)
+        XCTAssertEqual(state.cancelCount, 4, "the four that were running were cancelled")
+    }
+
+    func testZeroOrNegativeConcurrencyLimitIsClampedRatherThanDeadlocking() async {
+        let runner = RecordingRunner(ticks: 1)
+        let executor = WorkExecutor(runner: runner, concurrencyLimit: 0)
+        let plan = CapacityPlan(
+            displayClass: .compact,
+            visibleWindow: 1,
+            prefetchDepth: 0,
+            concurrentDecodes: 0,
+            decodeByteBudget: 1_024
+        )
+        XCTAssertEqual(plan.concurrentDecodes, 1, "a zero-decoder plan is a deadlock, not a setting")
+        await executor.apply(
+            ReplanDirective(
+                epoch: .initial,
+                plan: plan,
+                admit: [WorkKey("row:0")],
+                cancel: [],
+                retain: []
+            )
+        )
+        for _ in 0 ..< 16 { await Task.yield() }
+        let totalStarts = await runner.totalStarts()
+        XCTAssertEqual(totalStarts, 1, "work must still make progress")
+    }
+}

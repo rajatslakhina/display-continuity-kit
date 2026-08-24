@@ -44,6 +44,11 @@ public enum InvariantViolation: Sendable, Hashable, CustomStringConvertible {
     case duplicateAdmission(WorkKey, admissions: Int, cancellations: Int)
     /// A key was cancelled that was not in flight.
     case cancelWithoutAdmission(WorkKey)
+    /// A key was reported as *retained* while not in flight — a lie that reads
+    /// as a continuity win on a dashboard while the content never arrives.
+    /// Distinct from `duplicateAdmission` because the diagnosis differs: one is
+    /// wasted work, the other is missing work reported as present.
+    case retentionLie(WorkKey)
     /// One directive both starts and stops the same key.
     case admitAndCancelInSameDirective(WorkKey)
     /// The plan generation went backwards.
@@ -57,6 +62,8 @@ public enum InvariantViolation: Sendable, Hashable, CustomStringConvertible {
             return "duplicate admission of \(key): started \(admissions)x, cancelled \(cancellations)x"
         case .cancelWithoutAdmission(let key):
             return "cancelled \(key) which was not in flight"
+        case .retentionLie(let key):
+            return "reported \(key) as retained while it was not in flight"
         case .admitAndCancelInSameDirective(let key):
             return "\(key) both admitted and cancelled in one directive"
         case .epochRegression(let from, let to):
@@ -157,19 +164,30 @@ public struct FoldStormDriver: Sendable {
             // reports a key as retained after cancelling it is lying in the
             // most expensive possible way.
             for key in directive.retain where !inFlight.contains(key) {
-                violations.append(
-                    .duplicateAdmission(
-                        key,
-                        admissions: admissionCounts[key] ?? 0,
-                        cancellations: cancellationCounts[key] ?? 0
-                    )
-                )
+                violations.append(.retentionLie(key))
             }
             retentionCount += directive.retain.count
 
             if inFlight.count > inFlightBound {
                 violations.append(
                     .ledgerExceededBound(observed: inFlight.count, bound: inFlightBound)
+                )
+            }
+
+            // A deferred cancellation is a promise to stop something that is
+            // still running. Anything reported as held but not in flight is the
+            // same class of lie as a false retention — and, left unchecked, the
+            // held set is the one collection in the planner with no capacity of
+            // its own, so this is also the bound check for it.
+            for key in directive.deferredCancellations where !inFlight.contains(key) {
+                violations.append(.cancelWithoutAdmission(key))
+            }
+            if directive.deferredCancellations.count > inFlightBound {
+                violations.append(
+                    .ledgerExceededBound(
+                        observed: directive.deferredCancellations.count,
+                        bound: inFlightBound
+                    )
                 )
             }
         }
