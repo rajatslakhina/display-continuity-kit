@@ -51,12 +51,37 @@ final class CapacityPolicyTests: XCTestCase {
         )
     }
 
-    /// The decode budget is the one that *is* allowed to track area, because
-    /// what is resident genuinely doubles.
-    func testDecodeBudgetGrowsWithTheSurface() {
+    /// The decode budget is derived from *admitted rows*, not from area. This
+    /// asserts the exact identity rather than "it went up", which any monotone
+    /// function would satisfy — including the area-scaled version this design
+    /// deliberately rejects.
+    func testDecodeBudgetTracksAdmittedRowsAndNotArea() {
+        let bytesPerRow = 512 * 1024
+        for (displayClass, viewport) in [
+            (DisplayClass.compact, Viewport.coverDisplay),
+            (DisplayClass.expanded, Viewport.innerDisplay)
+        ] {
+            let plan = policy.plan(for: displayClass, viewport: viewport)
+            XCTAssertEqual(
+                plan.decodeByteBudget,
+                (plan.visibleWindow + plan.prefetchDepth) * bytesPerRow,
+                "the budget must be exactly what the plan can hold resident, for \(displayClass)"
+            )
+        }
+
+        // And the rejected alternative is measurably rejected: an area-scaled
+        // budget would authorise far more than the plan can ever produce.
         let compact = policy.plan(for: .compact, viewport: .coverDisplay)
         let expanded = policy.plan(for: .expanded, viewport: .innerDisplay)
-        XCTAssertGreaterThan(expanded.decodeByteBudget, compact.decodeByteBudget)
+        let areaRatio = Viewport.innerDisplay.area / Viewport.coverDisplay.area
+        let budgetRatio = Double(expanded.decodeByteBudget) / Double(compact.decodeByteBudget)
+
+        XCTAssertGreaterThan(budgetRatio, 1.0, "it still grows")
+        XCTAssertLessThan(
+            budgetRatio,
+            areaRatio,
+            "a ceiling that never binds is not a budget — this must not track area"
+        )
     }
 
     // MARK: - Degenerate geometry
