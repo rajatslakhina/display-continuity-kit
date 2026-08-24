@@ -98,9 +98,20 @@ public struct TransitionCoalescer: Sendable, Equatable {
         // Case 2: no change in class.
         if observed == current {
             guard let start = deferralStartedAt else { return .unchanged }
-            return now.millisecondsSince(start) >= window
-                ? .settled(at: current)
-                : .unchanged
+            guard now.millisecondsSince(start) >= window else { return .unchanged }
+            // Clear on the way out rather than waiting for `clearDeferral()`.
+            //
+            // `.settled` means "the window elapsed, issue the held
+            // cancellations" — an instruction that is only correct once. Leaving
+            // the deferral set made this a public type whose contract was
+            // "returns `.settled` forever until you remember to call something
+            // else", and `ContinuityPlanner` only looked correct because it does
+            // remember. A second consumer would have double-issued every
+            // cancellation. `clearDeferral()` stays, and stays idempotent, for
+            // the caller that needs to abandon a deferral without settling it.
+            deferredFrom = nil
+            deferralStartedAt = nil
+            return .settled(at: current)
         }
 
         // Case 3: a genuine transition.
@@ -116,6 +127,15 @@ public struct TransitionCoalescer: Sendable, Equatable {
             // Only start the clock on the *first* shrink of a run; a
             // shrink-then-shrink sequence must not keep extending the window
             // indefinitely, or cancellations would never be issued at all.
+            //
+            // With a two-valued `DisplayClass` this guard is currently
+            // unreachable: a pending deferral implies `current == .compact`, so
+            // any differing observation is a growth and Case 1 has already
+            // handled it. It is kept deliberately, because the guard is the
+            // thing that stays correct when a third display class is added —
+            // and a shrink-then-shrink run is precisely what a three-valued
+            // ladder makes reachable. `testRepeatedShrinksDoNotExtendTheWindow`
+            // exercises the same rule through Case 2, which *is* reachable today.
             if deferredFrom == nil {
                 deferredFrom = previous
                 deferralStartedAt = now

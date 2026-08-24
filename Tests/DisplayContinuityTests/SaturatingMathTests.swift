@@ -100,4 +100,47 @@ final class SaturatingMathTests: XCTestCase {
         XCTAssertEqual(plan.visibleWindow, 1, "floors at one row rather than zero")
         XCTAssertGreaterThanOrEqual(plan.concurrentDecodes, 1, "zero decoders is a deadlock")
     }
+
+    /// `abs(_:)` traps on `Int.min`, and row-distance-from-anchor is computed
+    /// from two values a caller controls — so the obvious spelling is a crash
+    /// waiting for an anchor nobody would think to pass.
+    func testDistanceIsTotalIncludingAtTheExtremes() {
+        XCTAssertEqual(Saturating.distance(10, 4), 6)
+        XCTAssertEqual(Saturating.distance(4, 10), 6, "distance is symmetric")
+        XCTAssertEqual(Saturating.distance(0, 0), 0)
+        XCTAssertEqual(Saturating.distance(0, .max), .max)
+        XCTAssertEqual(Saturating.distance(0, .min), .max, "saturates rather than trapping")
+        XCTAssertEqual(Saturating.distance(.max, .min), .max)
+        XCTAssertEqual(Saturating.distance(.min, .max), .max)
+        XCTAssertGreaterThanOrEqual(Saturating.distance(.min, .min), 0, "never negative")
+    }
+
+    /// `product` saturates an overflowed area instead of collapsing it, while
+    /// `dimension` still collapses an infinity that arrives as *input*.
+    ///
+    /// The two rules look contradictory and are not: an infinite input is a
+    /// division by an unmeasured container, whereas an infinite product is two
+    /// finite dimensions multiplied. Collapsing the second makes every
+    /// area-derived budget non-monotone at large magnitudes.
+    func testProductSaturatesOnOverflowWhileDimensionStillRejectsGarbage() {
+        XCTAssertEqual(Saturating.dimension(.infinity), 0, "an infinite *input* is garbage")
+        XCTAssertEqual(Saturating.dimension(.nan), 0)
+        XCTAssertEqual(Saturating.dimension(-1), 0)
+
+        XCTAssertEqual(Saturating.product(3, 4), 12)
+        XCTAssertEqual(Saturating.product(0, 1e300), 0)
+        XCTAssertEqual(Saturating.product(.nan, 2), 0, "NaN has no defensible clamp direction")
+        XCTAssertEqual(
+            Saturating.product(1e200, 1e200),
+            .greatestFiniteMagnitude,
+            "an overflowed area is an enormous area, not an absent one"
+        )
+        XCTAssertGreaterThanOrEqual(Saturating.product(-1e200, 1e200), 0, "never negative")
+
+        // The monotonicity this exists to protect, stated directly.
+        XCTAssertGreaterThanOrEqual(
+            Viewport(width: 1e200, height: 1e200).area,
+            Viewport(width: 1e150, height: 1e150).area
+        )
+    }
 }

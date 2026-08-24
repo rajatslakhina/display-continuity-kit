@@ -52,6 +52,20 @@ public struct ReplanDirective: Sendable, Hashable {
     /// Cancellations that were computed but deliberately held back pending a
     /// possible reversal. Informational — the executor takes no action on these.
     public let deferredCancellations: [WorkKey]
+    /// Priority of each admitted key. Lower is more important.
+    ///
+    /// This exists because `admit` is sorted *lexicographically*, and that
+    /// ordering is for reproducibility, not for scheduling. An executor bounded
+    /// by `plan.concurrentDecodes` cannot start everything it is given, so it
+    /// has to decide what to start **first** — and without this field the
+    /// planner's carefully computed priority order dies at the directive
+    /// boundary and the executor starts `row:10` ahead of `row:2` purely
+    /// because `"1" < "2"`.
+    ///
+    /// Keys absent from this map sort last, so a directive built by hand
+    /// without priorities degrades to the lexicographic order rather than
+    /// trapping.
+    public let admissionPriority: [WorkKey: Int]
 
     public init(
         epoch: Epoch,
@@ -59,7 +73,8 @@ public struct ReplanDirective: Sendable, Hashable {
         admit: [WorkKey],
         cancel: [WorkKey],
         retain: [WorkKey],
-        deferredCancellations: [WorkKey] = []
+        deferredCancellations: [WorkKey] = [],
+        admissionPriority: [WorkKey: Int] = [:]
     ) {
         self.epoch = epoch
         self.plan = plan
@@ -67,6 +82,18 @@ public struct ReplanDirective: Sendable, Hashable {
         self.cancel = cancel.sorted { $0.rawValue < $1.rawValue }
         self.retain = retain.sorted { $0.rawValue < $1.rawValue }
         self.deferredCancellations = deferredCancellations.sorted { $0.rawValue < $1.rawValue }
+        self.admissionPriority = admissionPriority
+    }
+
+    /// `admit`, in the order the executor should actually start work: most
+    /// important first, with a lexicographic tiebreak so the order stays
+    /// deterministic across runs.
+    public var admissionOrder: [WorkKey] {
+        admit.sorted { lhs, rhs in
+            let left = admissionPriority[lhs] ?? .max
+            let right = admissionPriority[rhs] ?? .max
+            return left == right ? lhs.rawValue < rhs.rawValue : left < right
+        }
     }
 
     /// True when this re-plan asks the executor to do nothing at all.
@@ -99,30 +126,51 @@ public struct WindowedDemandModel: DemandModel {
         self.detailPrefix = detailPrefix
     }
 
+    /// Hard ceiling on how many rows a single re-plan will ever demand.
+    ///
+    /// `CapacityPlan` only floors its fields, so a plan built through the public
+    /// initialiser with `visibleWindow: .max` carries a saturated
+    /// `admissionWindow`. Emitting one `DemandItem` per row for that window
+    /// against a large feed allocates until the process dies — which is the same
+    /// class of failure `WorkLedger` exists to prevent, reintroduced one layer
+    /// up. "The caller will pass a sane plan" is not a bound.
+    public static let maximumWindow = 4_096
+
     public func demand(for plan: CapacityPlan, anchor: Int, selection: ItemID?) -> [DemandItem] {
         guard itemCount > 0 else { return [] }
 
-        let window = plan.admissionWindow
+        let window = min(plan.admissionWindow, Self.maximumWindow)
         guard window > 0 else { return [] }
 
         // Centre the window on the anchor, saturating so a pathological anchor
         // (`Int.min`, `Int.max`) cannot wrap the bounds into an inverted range.
         let half = Saturating.divide(window, by: 2, fallback: 0)
         let rawLower = Saturating.subtract(anchor, half)
-        let lower = Saturating.clamp(rawLower, lower: 0, upper: max(0, itemCount - 1))
+
+        // Slide the window back off the end of the feed rather than truncating
+        // it against the last row.
+        //
+        // Clamping `lower` to `itemCount - 1` looks equivalent and is not: it
+        // shrinks the window as the anchor approaches the tail — a 40-row feed
+        // with a 16-row window served only 9 rows at the last row and *1* row
+        // for any overshooting anchor — so the bottom of a feed, which is
+        // exactly where pagination pressure is highest, got the least prefetch.
+        // The head of the feed slid correctly, which is why it went unnoticed.
+        let maxLower = Saturating.subtract(itemCount, window)
+        let lower = Saturating.clamp(rawLower, lower: 0, upper: max(0, maxLower))
         let rawUpper = Saturating.add(lower, window)
         let upper = Saturating.clamp(rawUpper, lower: lower, upper: itemCount)
 
         var items: [DemandItem] = []
-        // Saturating: `upper` and `lower` are both derived from a clamped
-        // anchor, but `CapacityPlan` only floors its fields — a plan built
-        // through the public initialiser with `visibleWindow: .max` yields a
-        // saturated `admissionWindow`, and a plain `+` here would trap.
+        // Saturating rather than `upper - lower + 1`: both bounds are clamped,
+        // but a negative or overflowing reservation would trap.
         items.reserveCapacity(Saturating.add(Saturating.subtract(upper, lower), 1))
 
         // `lower ..< upper` is well-formed: `upper` is clamped to be >= `lower`.
         for index in lower ..< upper {
-            let distance = abs(Saturating.subtract(index, anchor))
+            // `Saturating.distance`, not `abs(a - b)`: `abs(Int.min)` traps, and
+            // an `anchor` of `Int.max` puts the difference within one of it.
+            let distance = Saturating.distance(index, anchor)
             items.append(
                 DemandItem(key: WorkKey("\(rowPrefix):\(index)"), priority: distance)
             )

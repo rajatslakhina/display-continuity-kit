@@ -23,7 +23,19 @@ public struct CapacityPlan: Sendable, Hashable, Codable {
     public let prefetchDepth: Int
     /// Maximum image decodes permitted to run concurrently.
     public let concurrentDecodes: Int
-    /// Soft ceiling on decoded-image bytes held resident, in bytes.
+    /// Soft ceiling on decoded-image bytes held **resident**, in bytes.
+    ///
+    /// Deliberately narrower than `admissionWindow`, and the two answer
+    /// different questions. `admissionWindow` counts rows that may be *in
+    /// flight* — fetched ahead of the user in both directions. This counts rows
+    /// that may be *decoded and resident at once*: the visible window plus one
+    /// prefetch depth, i.e. the rows in front of the user. Prefetch behind the
+    /// anchor is fetched but not held as a decoded bitmap, because scrolling
+    /// backwards is the rarer motion and bitmaps are the expensive part.
+    ///
+    /// Bytes resident and requests outstanding are not the same budget, and
+    /// collapsing them into one number is how a decode ceiling ends up either
+    /// never binding or throttling work that was never resident anyway.
     public let decodeByteBudget: Int
 
     public init(

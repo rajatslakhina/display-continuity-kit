@@ -96,12 +96,47 @@ public enum Saturating {
         return value
     }
 
+    /// Absolute distance between two `Int`s, clamped.
+    ///
+    /// `abs(_:)` traps on `Int.min`, and `a - b` can legitimately produce it —
+    /// so row distance from a scroll anchor, computed from an index and an
+    /// anchor the caller controls, cannot use the obvious spelling. The failure
+    /// mode is a crash on a value nobody would think to pass in a test.
+    public static func distance(_ a: Int, _ b: Int) -> Int {
+        let delta = subtract(a, b)
+        return delta == .min ? .max : abs(delta)
+    }
+
     /// Sanitises a `Double` that is about to be used as a geometric dimension.
     ///
     /// NaN, infinities and negatives all collapse to `0`, which the capacity
-    /// policy then treats as "no usable area" and floors accordingly.
+    /// policy then treats as "no usable area" and floors accordingly. A raw
+    /// `+.infinity` arriving from a layout pass is *garbage* — the signature of
+    /// a division by a zero-height container that has not been measured yet —
+    /// so "not measured" is the honest reading.
     public static func dimension(_ value: Double) -> Double {
         guard value.isFinite, value > 0 else { return 0 }
         return value
+    }
+
+    /// The product of two already-sanitised dimensions, saturating on overflow.
+    ///
+    /// Deliberately *not* `dimension(a * b)`, and the distinction is the whole
+    /// point. An infinity that arrives as an input is garbage and must collapse
+    /// to `0`. An infinity that appears only because two large but perfectly
+    /// finite dimensions were multiplied is not garbage — it is a genuinely
+    /// enormous area, and collapsing it makes every area-derived budget
+    /// **non-monotone**: a 1e150-square viewport gets the maximum prefetch depth
+    /// while a strictly larger 1e200-square one gets the minimum, purely because
+    /// the second product overflows `Double` and the first does not.
+    ///
+    /// "Bigger screen, smaller budget" is worse than any clamp, and it only
+    /// appears at magnitudes no test author would think to pick — the existing
+    /// absurd-geometry test used 1e150, the one value whose square is finite.
+    public static func product(_ a: Double, _ b: Double) -> Double {
+        let result = a * b
+        if result.isNaN { return 0 }
+        if result.isInfinite { return result > 0 ? .greatestFiniteMagnitude : 0 }
+        return max(0, result)
     }
 }

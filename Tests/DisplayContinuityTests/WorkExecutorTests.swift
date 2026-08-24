@@ -66,6 +66,29 @@ final class WorkExecutorTests: XCTestCase {
 
     private func at(_ ms: Int) -> MonotonicInstant { MonotonicInstant(milliseconds: ms) }
 
+    /// Yields until `condition` holds, or until the bound is exhausted.
+    ///
+    /// A fixed number of `Task.yield()` calls is not a synchronisation
+    /// primitive. How many yields it takes for a spawned child task to reach
+    /// its first line depends on the executor's queue depth, which depends on
+    /// the machine — so `for _ in 0 ..< 8 { await Task.yield() }` passes on a
+    /// quiet laptop and fails on a loaded CI runner. That is not a flaky test,
+    /// it is a test asserting something it never established.
+    ///
+    /// Waiting on the *observable condition* instead makes these tests
+    /// deterministic without making them slow: they return as soon as the work
+    /// has actually happened, and the bound only exists so a genuine regression
+    /// fails rather than hangs.
+    private func settle(
+        upTo iterations: Int = 10_000,
+        until condition: @Sendable () async -> Bool
+    ) async {
+        for _ in 0 ..< iterations {
+            if await condition() { return }
+            await Task.yield()
+        }
+    }
+
     /// The headline claim, measured rather than asserted: across a fold storm,
     /// no unit of work is ever *started* twice.
     func testNoUnitOfWorkIsEverStartedTwiceAcrossAFoldStorm() async {
@@ -82,9 +105,11 @@ final class WorkExecutorTests: XCTestCase {
                 SurfaceInput(viewport: viewport, anchor: 0, selection: selection),
                 at: at(time)
             )
+            let expected = await runner.distinctStarted() + directive.admit.count
             await executor.apply(directive)
-            // Let the runner make progress between transitions.
-            for _ in 0 ..< 8 { await Task.yield() }
+            // Wait for this transition's admissions to actually begin before
+            // driving the next one, so the storm is a storm and not a queue.
+            await settle { await runner.distinctStarted() >= expected }
         }
 
         let worst = await runner.maxStartsForAnyKey()
@@ -122,9 +147,12 @@ final class WorkExecutorTests: XCTestCase {
                 retain: []
             )
             await executor.apply(naive)
-            for _ in 0 ..< 8 { await Task.yield() }
+            await settle { await runner.distinctStarted() >= naive.admit.count }
         }
 
+        // The restart is the point of this test, so wait for it rather than
+        // assuming it has happened.
+        await settle { await runner.maxStartsForAnyKey() > 1 }
         let worst = await runner.maxStartsForAnyKey()
         XCTAssertGreaterThan(
             worst,
@@ -150,7 +178,7 @@ final class WorkExecutorTests: XCTestCase {
         await executor.apply(
             ReplanDirective(epoch: .initial, plan: plan, admit: keys, cancel: [], retain: [])
         )
-        for _ in 0 ..< 16 { await Task.yield() }
+        await settle { await runner.startedKeys().count >= 3 }
 
         let state = await executor.snapshot()
         XCTAssertEqual(state.running.count, 3, "the limit must bind")
@@ -180,7 +208,7 @@ final class WorkExecutorTests: XCTestCase {
         await executor.apply(
             ReplanDirective(epoch: .initial, plan: plan, admit: keys, cancel: [], retain: [])
         )
-        for _ in 0 ..< 8 { await Task.yield() }
+        await settle { await runner.startedKeys().count >= 1 }
 
         // Cancel the three that never started.
         await executor.apply(
@@ -192,7 +220,7 @@ final class WorkExecutorTests: XCTestCase {
                 retain: [keys[0]]
             )
         )
-        for _ in 0 ..< 8 { await Task.yield() }
+        await settle { await executor.snapshot().queued.isEmpty }
 
         let state = await executor.snapshot()
         XCTAssertEqual(state.cancelCount, 0, "queued-but-unstarted work costs nothing to drop")
@@ -216,14 +244,14 @@ final class WorkExecutorTests: XCTestCase {
         await executor.apply(
             ReplanDirective(epoch: .initial, plan: plan, admit: [key], cancel: [], retain: [])
         )
-        for _ in 0 ..< 8 { await Task.yield() }
+        await settle { await runner.startCount(key) == 1 }
         let firstStarts = await runner.startCount(key)
         XCTAssertEqual(firstStarts, 1)
 
         await executor.apply(
             ReplanDirective(epoch: Epoch(1), plan: plan, admit: [], cancel: [key], retain: [])
         )
-        for _ in 0 ..< 64 { await Task.yield() }
+        await settle { await executor.snapshot().cancelCount == 1 }
 
         let state = await executor.snapshot()
         XCTAssertEqual(state.cancelCount, 1, "cancelling running work is a real cancellation")
@@ -245,7 +273,7 @@ final class WorkExecutorTests: XCTestCase {
             await executor.apply(
                 ReplanDirective(epoch: Epoch(epoch), plan: plan, admit: [key], cancel: [], retain: [])
             )
-            for _ in 0 ..< 4 { await Task.yield() }
+            await settle { await runner.startedKeys().contains(key) }
         }
         let state = await executor.snapshot()
         XCTAssertEqual(state.startCounts[key], 1, "a defensive re-admit must not restart running work")
@@ -271,14 +299,111 @@ final class WorkExecutorTests: XCTestCase {
                 retain: []
             )
         )
-        for _ in 0 ..< 8 { await Task.yield() }
+        await settle { await runner.startedKeys().count >= 4 }
         await executor.cancelAll()
-        for _ in 0 ..< 16 { await Task.yield() }
 
         let state = await executor.snapshot()
         XCTAssertTrue(state.running.isEmpty)
         XCTAssertTrue(state.queued.isEmpty)
         XCTAssertEqual(state.cancelCount, 4, "the four that were running were cancelled")
+    }
+
+    /// Under a binding concurrency limit, *which* work starts is the whole
+    /// question — and the answer must be the planner's answer.
+    ///
+    /// `ReplanDirective.admit` is sorted lexicographically so that two runs over
+    /// the same input produce byte-identical directives. That is reproducibility,
+    /// not scheduling: consuming it directly starts `row:10` before `row:2`,
+    /// because `"1" < "2"`. This is the test that catches it.
+    func testTheConcurrencyLimitStartsTheRowsNearestTheAnchorFirst() async {
+        let runner = BlockingRunner()
+        let executor = WorkExecutor(runner: runner, concurrencyLimit: 3)
+
+        let plan = CapacityPlan(
+            displayClass: .compact,
+            visibleWindow: 12,
+            prefetchDepth: 0,
+            concurrentDecodes: 3,
+            decodeByteBudget: 1_024
+        )
+        // Anchor at row 0: priority is distance, so 0, 1, 2 are the three that
+        // must run and 3, 4, 5 the head of the queue. Lexicographic order would
+        // pick 0, 1, 10.
+        let keys = (0 ..< 12).map { WorkKey("row:\($0)") }
+        var priorities: [WorkKey: Int] = [:]
+        for (index, key) in keys.enumerated() { priorities[key] = index }
+
+        await executor.apply(
+            ReplanDirective(
+                epoch: .initial,
+                plan: plan,
+                admit: keys,
+                cancel: [],
+                retain: [],
+                admissionPriority: priorities
+            )
+        )
+        await settle { await runner.startedKeys().count >= 3 }
+
+        let state = await executor.snapshot()
+        XCTAssertEqual(
+            state.running,
+            [WorkKey("row:0"), WorkKey("row:1"), WorkKey("row:2")],
+            "the executor started the wrong rows — priority died at the directive boundary"
+        )
+        XCTAssertEqual(
+            Array(state.queued.prefix(3)),
+            [WorkKey("row:3"), WorkKey("row:4"), WorkKey("row:5")],
+            "the queue must be in priority order too, not lexicographic"
+        )
+
+        await executor.cancelAll()
+    }
+
+    /// Work that has not started has cost nothing, so a newly admitted row
+    /// beside the anchor must not wait behind a stale row far from it.
+    func testNewlyAdmittedHigherPriorityWorkJumpsThePendingQueue() async {
+        let runner = BlockingRunner()
+        let executor = WorkExecutor(runner: runner, concurrencyLimit: 1)
+        let plan = CapacityPlan(
+            displayClass: .compact,
+            visibleWindow: 8,
+            prefetchDepth: 0,
+            concurrentDecodes: 1,
+            decodeByteBudget: 1_024
+        )
+
+        let far = (5 ..< 9).map { WorkKey("row:\($0)") }
+        await executor.apply(
+            ReplanDirective(
+                epoch: .initial,
+                plan: plan,
+                admit: far,
+                cancel: [],
+                retain: [],
+                admissionPriority: Dictionary(uniqueKeysWithValues: far.enumerated().map { ($1, 50 + $0) })
+            )
+        )
+        await settle { await runner.startedKeys().count >= 1 }
+
+        let near = WorkKey("row:1")
+        await executor.apply(
+            ReplanDirective(
+                epoch: Epoch(1),
+                plan: plan,
+                admit: [near],
+                cancel: [],
+                retain: [],
+                admissionPriority: [near: 0]
+            )
+        )
+        await settle { await executor.snapshot().queued.first == near }
+
+        let state = await executor.snapshot()
+        XCTAssertEqual(state.queued.first, near, "the nearer row must be next to start")
+        XCTAssertEqual(state.running.count, 1, "and nothing already running was disturbed")
+
+        await executor.cancelAll()
     }
 
     func testZeroOrNegativeConcurrencyLimitIsClampedRatherThanDeadlocking() async {
@@ -301,7 +426,7 @@ final class WorkExecutorTests: XCTestCase {
                 retain: []
             )
         )
-        for _ in 0 ..< 16 { await Task.yield() }
+        await settle { await runner.totalStarts() == 1 }
         let totalStarts = await runner.totalStarts()
         XCTAssertEqual(totalStarts, 1, "work must still make progress")
     }

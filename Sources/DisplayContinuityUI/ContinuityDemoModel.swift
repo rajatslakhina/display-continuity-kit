@@ -51,6 +51,8 @@ public final class ContinuityDemoModel {
     private let policy = AreaProportionalCapacityPolicy()
     private let ledgerCapacity: Int
     private var clock: MonotonicInstant = .zero
+    /// The instant of the newest re-plan whose results have been published.
+    private var lastPublished: MonotonicInstant = .zero
     private var anchor: Int = 0
 
     /// - Parameters:
@@ -170,26 +172,46 @@ public final class ContinuityDemoModel {
     // MARK: - Private
 
     private func replan(viewport: Viewport, advancing milliseconds: Int) async {
-        // Advance and capture in one main-actor step, with no `await` between
-        // them. Concurrent callers therefore each get a distinct, increasing
-        // instant; reading `clock` again after the suspension would let two
-        // in-flight re-plans hand the planner out-of-order timestamps.
+        // Advance, capture, and publish the class in one main-actor step, with
+        // no `await` between them. Concurrent callers therefore each get a
+        // distinct, increasing instant; reading `clock` again after the
+        // suspension would let two in-flight re-plans hand the planner
+        // out-of-order timestamps.
         clock = clock.advanced(byMilliseconds: milliseconds)
         let instant = clock
         let resolved = resolver.displayClass(for: viewport)
+        // Published here rather than after the awaits. Writing it on the far
+        // side of a suspension reintroduced the exact race the doc comment on
+        // `setDisplayClass(_:)` claims to have closed: tap 1's late write
+        // clobbered tap 2's synchronous one, and the screen ended up showing
+        // the class the user had already left.
+        displayClass = resolved
         let input = SurfaceInput(viewport: viewport, anchor: anchor, selection: selection)
 
         let directive = await planner.apply(input, at: instant)
         let projection = await store.projection(for: surface, displayClass: resolved)
 
-        displayClass = resolved
+        // Counters are order-independent, so they are always applied.
+        totalRetained += directive.retain.count
+        totalAdmitted += directive.admit.count
+
+        // Everything else is *state*, and a slower re-plan returning last must
+        // not overwrite a newer one. Actor arrival order is not suspension
+        // order, so "they were dispatched in order" is not an argument.
+        guard instant >= lastPublished else { return }
+        lastPublished = instant
         self.projection = projection
-        absorb(directive)
+        publish(directive)
+    }
+
+    /// Applies the parts of a directive that represent current state.
+    private func publish(_ directive: ReplanDirective) {
+        lastDirective = directive
+        plan = directive.plan
     }
 
     private func absorb(_ directive: ReplanDirective) {
-        lastDirective = directive
-        plan = directive.plan
+        publish(directive)
         totalRetained += directive.retain.count
         totalAdmitted += directive.admit.count
     }

@@ -33,22 +33,60 @@ final class CapacityPolicyTests: XCTestCase {
     }
 
     /// The documented design decision, stated as an executable claim: prefetch
-    /// depth must grow *more slowly* than area. A linear-scaling regression
-    /// fails here.
-    func testPrefetchScalesSubLinearlyWithArea() {
-        let compact = policy.plan(for: .compact, viewport: .coverDisplay)
-        let expanded = policy.plan(for: .expanded, viewport: .innerDisplay)
-
-        let areaRatio = Viewport.innerDisplay.area / Viewport.coverDisplay.area
-        let prefetchRatio = Double(expanded.prefetchDepth) / Double(compact.prefetchDepth)
-
-        XCTAssertGreaterThan(areaRatio, 1.5, "the inner display really is much larger")
-        XCTAssertGreaterThan(prefetchRatio, 1.0, "but prefetch still grows")
-        XCTAssertLessThan(
-            prefetchRatio,
-            areaRatio,
-            "prefetch must grow sub-linearly with area — linear scaling is the rejected alternative"
+    /// depth grows like **√area**, not like area.
+    ///
+    /// The obvious spelling of this test is vacuous, and shipped that way for a
+    /// while: comparing only the cover and inner displays and asserting
+    /// `prefetchRatio < areaRatio` passes against a *linear* implementation,
+    /// because the inner display is 1.94× the area and `4 × 1.94 = 7.77`
+    /// truncates to 7, so `7/4 = 1.75 < 1.94` holds anyway. Integer truncation
+    /// silently manufactured the sub-linearity the test claimed to detect.
+    ///
+    /// This version picks areas far enough apart that truncation cannot hide
+    /// the difference and asserts the law itself. Replacing `.squareRoot()`
+    /// with plain `areaRatio` fails every row below.
+    func testPrefetchScalesWithTheSquareRootOfAreaNotWithArea() {
+        let base = Viewport.coverDisplay
+        XCTAssertEqual(
+            policy.plan(for: .compact, viewport: base).prefetchDepth,
+            4,
+            "the reference viewport is what every ratio below is relative to"
         )
+
+        // Linear scaling would give 16, 36 and 64 (clamped to 16, 32, 32).
+        for (linearScale, expected) in [(2.0, 8), (3.0, 12), (4.0, 16)] {
+            let viewport = Viewport(width: base.width * linearScale, height: base.height * linearScale)
+            let areaRatio = viewport.area / base.area
+            XCTAssertEqual(areaRatio, linearScale * linearScale, accuracy: 1e-9)
+            XCTAssertEqual(
+                policy.plan(for: .compact, viewport: viewport).prefetchDepth,
+                expected,
+                "\(Int(areaRatio))× the area must give \(Int(linearScale))× the prefetch, not \(Int(areaRatio))×"
+            )
+        }
+    }
+
+    /// A strictly larger viewport must never receive a strictly smaller budget.
+    ///
+    /// This is the property that a "sanitise non-finite values to zero" rule
+    /// quietly breaks: once `width * height` overflows `Double`, collapsing the
+    /// product to `0` makes an enormous viewport look like a degenerate one, and
+    /// the budget falls off a cliff at a magnitude no test author would think to
+    /// pick. `testAbsurdViewportSaturatesRatherThanTraps` used 1e150 — the one
+    /// absurd value whose square is still finite.
+    func testBudgetsAreMonotoneInAreaEvenPastDoubleOverflow() {
+        let magnitudes = [1e3, 1e75, 1e150, 1e200, 1e300, Double.greatestFiniteMagnitude]
+        var previous = 0
+        for magnitude in magnitudes {
+            let plan = policy.plan(for: .expanded, viewport: Viewport(width: magnitude, height: magnitude))
+            XCTAssertGreaterThanOrEqual(
+                plan.prefetchDepth,
+                previous,
+                "a \(magnitude)-square viewport got less prefetch than a smaller one"
+            )
+            previous = plan.prefetchDepth
+        }
+        XCTAssertEqual(previous, 32, "and the largest representable viewport lands on the ceiling")
     }
 
     /// The decode budget is derived from *admitted rows*, not from area. This
