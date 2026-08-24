@@ -25,8 +25,11 @@ public struct Viewport: Sendable, Hashable, Codable {
     /// Area in square points. Always finite and non-negative.
     ///
     /// The product of two sanitised dimensions can still overflow to
-    /// `+.infinity` for absurd inputs, so it is re-sanitised on the way out.
-    public var area: Double { Saturating.dimension(width * height) }
+    /// `+.infinity`, so it goes through `Saturating.product` — which saturates
+    /// rather than collapsing to `0`. Collapsing here would make every
+    /// area-derived budget non-monotone at large magnitudes: a bigger screen
+    /// would get a smaller prefetch depth.
+    public var area: Double { Saturating.product(width, height) }
 
     /// The zero viewport — what a scene reports before its first layout pass.
     public static let zero = Viewport(width: 0, height: 0)
