@@ -7,9 +7,16 @@
 
 /// A monotonically increasing plan generation.
 ///
-/// Bumped once per accepted display-class transition. Saturates at `Int.max`
-/// rather than wrapping: a wrapped epoch would silently make stale work look
-/// current, which is precisely the failure this type exists to prevent.
+/// Bumped once per **budget change**, which is not the same thing as a
+/// display-class change and not the same thing as a re-plan. A resize that
+/// leaves the class alone but changes the derived plan advances the epoch; a
+/// scroll that changes only what is wanted does not. The rule is "does work
+/// planned before this point still belong to the same budget", because that is
+/// the question a late response has to answer.
+///
+/// Saturates at `Int.max` rather than wrapping: a wrapped epoch would silently
+/// make stale work look current, which is precisely the failure this type
+/// exists to prevent.
 public struct Epoch: Sendable, Hashable, Comparable, Codable, CustomStringConvertible {
     public let value: Int
 
