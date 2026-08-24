@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux:
+    # The whole core is platform-agnostic Swift, so it can be built and fully
+    # tested headlessly. `-warnings-as-errors` makes the "zero warnings" claim
+    # in the README machine-enforced rather than asserted in prose.
+    name: Linux · build + test (warnings are errors)
+    runs-on: ubuntu-latest
+    container: swift:6.0
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Swift version
+        run: swift --version
+
+      - name: Build (warnings are errors)
+        run: swift build -Xswiftc -warnings-as-errors
+
+      - name: Test (warnings are errors)
+        run: swift test -Xswiftc -warnings-as-errors
+
+  ios:
+    # The SwiftUI layer is the half Linux cannot see. This job compiles it for
+    # a simulator destination.
+    #
+    # `generic/platform=iOS Simulator` on purpose: pinning to a named device
+    # ties the job to whichever simulator *runtimes* happen to be on that day's
+    # runner image, and they are not guaranteed. A compile-only check needs no
+    # device to exist.
+    name: iOS Simulator · compile the SwiftUI layer
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Xcode version
+        run: xcodebuild -version
+
+      - name: Build DisplayContinuityUI for iOS Simulator
+        run: |
+          xcodebuild build \
+            -scheme DisplayContinuityUI \
+            -destination 'generic/platform=iOS Simulator' \
+            -skipPackagePluginValidation \
+            CODE_SIGNING_ALLOWED=NO
