@@ -287,6 +287,10 @@ final class ContinuityPlannerTests: XCTestCase {
     /// capacity" are true by construction and would pass for a planner that
     /// never bumps the epoch at all. What is not true by construction is that
     /// every directive a racing caller receives is internally coherent.
+    ///
+    /// Per-directive coherence is necessary and **not sufficient** — see
+    /// `testConcurrentRePlansNeverAdmitTheSameWorkTwice`, which covers the
+    /// property this one structurally cannot.
     func testConcurrentObserversAlwaysReceiveCoherentDirectives() async {
         let capacity = 24
         let planner = makePlanner(items: 500, ledgerCapacity: capacity)
@@ -343,6 +347,129 @@ final class ContinuityPlannerTests: XCTestCase {
             directives.contains { $0.epoch > .initial },
             "the epoch never advanced, so no display-class change was observed"
         )
+    }
+
+    /// The property the per-directive test above structurally cannot reach.
+    ///
+    /// `replan` has no `await` in it, so the whole pass is atomic and no caller
+    /// can observe it half-done. That is the load-bearing claim of this file —
+    /// and until this test existed, **nothing enforced it**: injecting a single
+    /// `await Task.yield()` between the cancellation pass and the admission pass
+    /// left the suite 122/0 green while producing real duplicate admissions and
+    /// real retention lies. The per-directive test cannot catch it because each
+    /// individual directive stays disjoint and bounded under the mutation; the
+    /// violation only exists *across* directives.
+    ///
+    /// The assertions here are deliberately **order-independent**, because there
+    /// is no way to recover the actor's true serialisation order from the
+    /// outside. Two counting invariants survive that:
+    ///
+    /// 1. A key can only be started again after it has been stopped, so across
+    ///    the whole run `admits(key) <= cancels(key) + 1`.
+    /// 2. Retaining a key asserts it is already in flight, so a key that appears
+    ///    in any `retain` must appear in some `admit`.
+    ///
+    /// Both hold for any *serial* sequence of atomic passes, and both break
+    /// under interleaving.
+    func testConcurrentRePlansNeverAdmitTheSameWorkTwice() async {
+        let planner = makePlanner(items: 500, ledgerCapacity: 24)
+
+        let directives: [ReplanDirective] = await withTaskGroup(of: ReplanDirective.self) { group in
+            for index in 0 ..< 64 {
+                group.addTask {
+                    // Fold, unfold and scroll all at once, so the run produces
+                    // genuine cancellations rather than a stream of no-ops.
+                    let viewport: Viewport = index.isMultiple(of: 2) ? .innerDisplay : .coverDisplay
+                    return await planner.apply(
+                        SurfaceInput(
+                            viewport: viewport,
+                            anchor: (index * 7) % 400,
+                            selection: ItemID("i\(index % 5)")
+                        ),
+                        at: MonotonicInstant(milliseconds: index * 137)
+                    )
+                }
+            }
+            var results: [ReplanDirective] = []
+            for await directive in group { results.append(directive) }
+            return results
+        }
+
+        var admits: [WorkKey: Int] = [:]
+        var cancels: [WorkKey: Int] = [:]
+        var retains: [WorkKey: Int] = [:]
+        for directive in directives {
+            for key in directive.admit { admits[key, default: 0] += 1 }
+            for key in directive.cancel { cancels[key, default: 0] += 1 }
+            for key in directive.retain { retains[key, default: 0] += 1 }
+        }
+
+        XCTAssertFalse(admits.isEmpty, "the race never admitted anything")
+        XCTAssertFalse(cancels.isEmpty, "the race never cancelled anything — it proved nothing")
+
+        for (key, count) in admits {
+            XCTAssertLessThanOrEqual(
+                count,
+                (cancels[key] ?? 0) + 1,
+                "\(key) was started \(count) times against \(cancels[key] ?? 0) stops — "
+                    + "a re-plan admitted work that was already in flight"
+            )
+        }
+
+        for (key, count) in retains where count > 0 {
+            XCTAssertGreaterThan(
+                admits[key] ?? 0,
+                0,
+                "\(key) was retained \(count) times but never admitted — retention lie"
+            )
+        }
+    }
+
+    /// The frozen admission list, pinned directly rather than only via the storm.
+    ///
+    /// Computing `!ledger.contains(_:)` inside the admission loop looks
+    /// equivalent to freezing the list first and is not: the loop runs
+    /// best-priority-first, so a key already in flight whose priority got worse
+    /// (the anchor moved) is evicted early in the pass — and by the time the
+    /// loop reaches that key, a live check sees it as absent and re-admits it.
+    /// The same key then appears in both `cancel` and `admit` in one directive,
+    /// which is the duplicated-fetch bug in miniature.
+    ///
+    /// The parameters are not arbitrary. It reproduces only when the ledger is
+    /// smaller than the demand window (so eviction actually happens) *and* the
+    /// anchor moves by a few rows per step (so the overlap between consecutive
+    /// windows is large enough for an in-flight key's rank to degrade). A
+    /// ledger of 8 with a 3-row anchor step is the smallest configuration that
+    /// reproduces it; the original discovery needed the full storm harness.
+    func testAKeyEvictedDuringAdmissionIsNeverReAdmittedInTheSameDirective() async {
+        let capacity = 8
+        let planner = makePlanner(items: 500, ledgerCapacity: capacity)
+
+        var sawEviction = false
+        for step in 0 ..< 12 {
+            let directive = await planner.apply(
+                SurfaceInput(
+                    viewport: step.isMultiple(of: 2) ? .innerDisplay : .coverDisplay,
+                    anchor: step * 3,
+                    selection: selection
+                ),
+                at: at(step * 300)
+            )
+            let admit = Set(directive.admit)
+            let cancel = Set(directive.cancel)
+            XCTAssertTrue(
+                admit.isDisjoint(with: cancel),
+                "step \(step): \(admit.intersection(cancel).map(\.rawValue).sorted()) "
+                    + "was both admitted and cancelled in one directive"
+            )
+            XCTAssertLessThanOrEqual(
+                admit.count + directive.retain.count,
+                capacity,
+                "step \(step) described more live work than the ledger can hold"
+            )
+            if !cancel.isEmpty { sawEviction = true }
+        }
+        XCTAssertTrue(sawEviction, "the ledger never came under pressure — the test proved nothing")
     }
 
     // MARK: - Directive shape
