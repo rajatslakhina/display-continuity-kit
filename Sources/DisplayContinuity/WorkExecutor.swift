@@ -55,11 +55,32 @@ public actor WorkExecutor {
         /// stay at 1 across a fold storm.
         public let startCounts: [WorkKey: Int]
         public let cancelCount: Int
+        /// Completions that arrived from a run this executor had already
+        /// replaced. See `finish(_:id:)` — a non-zero value here is normal
+        /// under cancel-then-re-admit, and a *silent* one is the bug.
+        public let staleCompletions: Int
+        /// Completions whose work was admitted under an epoch older than the
+        /// one currently in force. This is the number `Epoch` exists to make
+        /// countable: a late response from a plan that no longer applies.
+        public let supersededCompletions: Int
+        /// The plan generation of the last directive applied.
+        public let epoch: Epoch
+    }
+
+    /// A running unit of work, plus the two stamps that make it identifiable.
+    private struct RunningWork {
+        /// Unique per *start*, not per key. `Epoch` is not enough on its own:
+        /// it only advances when the budget changes, so cancel-then-re-admit
+        /// inside one epoch would produce two runs with identical stamps.
+        let id: Int
+        /// The plan generation this run was admitted under.
+        let epoch: Epoch
+        let task: Task<Void, Never>
     }
 
     private let runner: any WorkRunning
     private var limit: Int
-    private var running: [WorkKey: Task<Void, Never>]
+    private var running: [WorkKey: RunningWork]
     /// Admitted-but-not-yet-started work, most important first.
     private var queue: [WorkKey]
     /// Membership shadow of `queue`. `Array.contains` inside the admit loop
@@ -68,9 +89,19 @@ public actor WorkExecutor {
     /// feed. Three lines to make it O(1).
     private var queued: Set<WorkKey>
     /// Priorities carried over from the directives that admitted each key.
+    ///
+    /// Pruned whenever a key stops being owed — cancelled, completed, or torn
+    /// down. An earlier revision pruned only on explicit cancellation, which
+    /// left one entry per completed key forever: an unbounded dictionary in the
+    /// package whose whole argument is that unbounded in-flight state is how a
+    /// fold storm turns into an OOM.
     private var priorities: [WorkKey: Int]
     private var startCounts: [WorkKey: Int]
     private var cancelCount: Int
+    private var staleCompletions: Int
+    private var supersededCompletions: Int
+    private var currentEpoch: Epoch
+    private var nextRunID: Int
 
     public init(runner: any WorkRunning, concurrencyLimit: Int = 4) {
         self.runner = runner
@@ -81,6 +112,10 @@ public actor WorkExecutor {
         self.priorities = [:]
         self.startCounts = [:]
         self.cancelCount = 0
+        self.staleCompletions = 0
+        self.supersededCompletions = 0
+        self.currentEpoch = .initial
+        self.nextRunID = 0
     }
 
     public func snapshot() -> State {
@@ -88,9 +123,19 @@ public actor WorkExecutor {
             running: running.keys.sorted { $0.rawValue < $1.rawValue },
             queued: queue,
             startCounts: startCounts,
-            cancelCount: cancelCount
+            cancelCount: cancelCount,
+            staleCompletions: staleCompletions,
+            supersededCompletions: supersededCompletions,
+            epoch: currentEpoch
         )
     }
+
+    /// The epoch a currently-running unit of work was admitted under.
+    public func epoch(of key: WorkKey) -> Epoch? { running[key]?.epoch }
+
+    /// How many keys carry a remembered priority. Exposed so the bound can be
+    /// asserted rather than assumed.
+    public var trackedPriorityCount: Int { priorities.count }
 
     /// Honours a directive.
     ///
@@ -103,15 +148,19 @@ public actor WorkExecutor {
     /// retained work is work this executor does not touch.
     public func apply(_ directive: ReplanDirective) {
         limit = max(1, directive.plan.concurrentDecodes)
+        // Monotonic: a directive built by hand with a stale epoch must not walk
+        // the executor's notion of "current" backwards.
+        currentEpoch = max(currentEpoch, directive.epoch)
 
-        for (key, priority) in directive.admissionPriority {
-            priorities[key] = priority
-        }
-
+        // Cancellations are processed before admissions, so priorities are
+        // recorded *after* the cancel loop — otherwise a key appearing in both
+        // `cancel` and `admissionPriority` would have its priority stripped and
+        // queue at `.max`. The planner keeps the two disjoint; a hand-built
+        // directive need not.
         var cancelledFromQueue: Set<WorkKey> = []
         for key in directive.cancel {
-            if let task = running.removeValue(forKey: key) {
-                task.cancel()
+            if let work = running.removeValue(forKey: key) {
+                work.task.cancel()
                 cancelCount += 1
             } else if queued.remove(key) != nil {
                 // Never started, so nothing to cancel — it simply stops being
@@ -125,6 +174,10 @@ public actor WorkExecutor {
             queue.removeAll { cancelledFromQueue.contains($0) }
         }
 
+        for (key, priority) in directive.admissionPriority {
+            priorities[key] = priority
+        }
+
         // `admissionOrder`, not `admit`: the latter is sorted lexicographically
         // for reproducible diffs, which is not a schedule.
         for key in directive.admissionOrder where running[key] == nil && !queued.contains(key) {
@@ -136,6 +189,11 @@ public actor WorkExecutor {
         // nothing, so there is no reason to make a newly admitted row next to
         // the anchor wait behind a stale row twenty positions away. Ties break
         // lexicographically so the schedule is reproducible.
+        //
+        // This *also* means insertion order above cannot be observed, so
+        // consuming `admit` instead of `admissionOrder` here is invisible to a
+        // test that only inspects the queue. `ReplanDirectiveTests` pins
+        // `admissionOrder` directly for that reason.
         queue.sort { lhs, rhs in
             let left = priorities[lhs] ?? .max
             let right = priorities[rhs] ?? .max
@@ -147,8 +205,8 @@ public actor WorkExecutor {
 
     /// Cancels everything. Used on surface teardown.
     public func cancelAll() {
-        for (_, task) in running {
-            task.cancel()
+        for (_, work) in running {
+            work.task.cancel()
             cancelCount += 1
         }
         running.removeAll()
@@ -165,18 +223,48 @@ public actor WorkExecutor {
             queued.remove(key)
             guard running[key] == nil else { continue }
             startCounts[key, default: 0] += 1
+            nextRunID = Saturating.add(nextRunID, 1)
+            let id = nextRunID
             let runner = self.runner
-            running[key] = Task { [weak self] in
+            let task = Task { [weak self] in
                 await runner.run(key)
                 // `weak self` so a torn-down executor does not keep itself
                 // alive through an in-flight child task.
-                await self?.finish(key)
+                await self?.finish(key, id: id)
             }
+            running[key] = RunningWork(id: id, epoch: currentEpoch, task: task)
         }
     }
 
-    private func finish(_ key: WorkKey) {
+    /// Completion callback, keyed by *run* rather than by key.
+    ///
+    /// The `id` check is the whole point. Cancellation is cooperative, so a
+    /// cancelled body keeps running until it next checks `Task.isCancelled` —
+    /// and if the same key is re-admitted in the meantime, the old body's
+    /// eventual return would otherwise evict the **new** run's entry. The
+    /// executor would then believe the key is idle, `pump()` would start it a
+    /// second time, and two bodies would be live for one key: the exact
+    /// duplicated-fetch failure this package exists to prevent, reintroduced
+    /// inside its own reference consumer. Cancel-then-re-admit is not an exotic
+    /// path here — it is the fold storm.
+    private func finish(_ key: WorkKey, id: Int) {
+        guard let work = running[key], work.id == id else {
+            // A run this executor has already replaced or torn down. Counted
+            // rather than ignored: silence is what made this a bug.
+            staleCompletions += 1
+            return
+        }
+        if work.epoch < currentEpoch {
+            // A response planned under a budget that no longer applies. The
+            // work still finished, so it leaves `running` — but this is the
+            // number `Epoch` exists to make countable, rather than a late
+            // arrival being indistinguishable from a current one.
+            supersededCompletions += 1
+        }
         running.removeValue(forKey: key)
+        if !queued.contains(key) {
+            priorities.removeValue(forKey: key)
+        }
         pump()
     }
 }
