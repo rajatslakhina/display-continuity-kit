@@ -60,8 +60,13 @@ public final class ContinuityDemoModel {
     ///     The host app owns this value — it is the one piece of policy that
     ///     ships in the binary rather than being derived at runtime.
     ///   - itemCount: how many rows the demo feed contains.
+    /// Ceiling on the demo feed. `ContinuityDemoView(itemCount:)` is public, and
+    /// `(0 ..< count).map` with no bound is the same "the caller will pass a
+    /// sane value" assumption `WindowedDemandModel` refuses to make.
+    public static let maximumItemCount = 10_000
+
     public init(fallbackPlan: CapacityPlan = .conservative, itemCount: Int = 40, ledgerCapacity: Int = 48) {
-        let count = max(0, itemCount)
+        let count = Saturating.clamp(itemCount, lower: 0, upper: Self.maximumItemCount)
         self.plan = fallbackPlan
         self.displayClass = fallbackPlan.displayClass
         self.ledgerCapacity = max(1, ledgerCapacity)

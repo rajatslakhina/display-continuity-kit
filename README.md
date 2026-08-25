@@ -41,7 +41,7 @@ This is deliberately a **system design** problem *and* an **architecture** probl
 | `TransitionCoalescer` | Collapses a fold/unfold storm. Growth applies immediately; shrink defers its cancellations. |
 | `WorkLedger` | The bounded in-flight set, with priority eviction. |
 | `Epoch` | A monotonic plan generation stamped onto every unit of work, so a late response from a superseded plan is *identifiable* rather than indistinguishable. |
-| `WorkExecutor` / `WorkRunning` | The reference consumer. Turns `admit` into real running `Task`s, `cancel` into real cancellation, and `retain` into **nothing at all**. Enforces `concurrentDecodes` as a hard limit, ordering the overflow by `ReplanDirective.admissionPriority`. |
+| `WorkExecutor` / `WorkRunning` | The reference consumer. Turns `admit` into real running `Task`s, `cancel` into real cancellation, and `retain` into **nothing at all**. Enforces `concurrentDecodes` as a hard limit, ordering the overflow by `ReplanDirective.admissionPriority`, and stamps every run so a completion from a superseded plan is *countable* rather than indistinguishable. |
 | `FoldStormDriver` | Replays scripted transition sequences with time supplied by fiat and checks six continuity invariants. |
 
 ### Micro — who owns the state a disappearing pane was holding
@@ -76,6 +76,8 @@ public struct ReplanDirective {
 
 `admissionPriority` is there because `admit` is sorted **lexicographically**, and that ordering is for reproducible diffs, not for scheduling. An executor bounded by `concurrentDecodes` cannot start everything it is handed, so it has to choose — and reading `admit` in order starts `row:10` before `row:2`, because `"1" < "2"`. The planner's ranking has to cross the directive boundary or it is decoration. (It did not, for a while: a review found the executor advertising "a priority queue behind it" over a type that carried no priority at all.)
 
+One honest wrinkle, because a later review caught the first version of this paragraph overclaiming: `WorkExecutor` also **re-sorts its whole pending queue** by priority on every apply — it has to, so that a newly admitted row beside the anchor can overtake a stale row already waiting. That re-sort makes consuming `admit` instead of `admissionOrder` *inside the executor* unobservable, so the executor-level ordering test cannot fail for it. The ordering is therefore pinned one layer down, on `ReplanDirective` itself, where nothing compensates. See the `admissionOrder` rows in the mutation matrix: swapping the executor's source is green **by design**; breaking `admissionOrder` is red.
+
 `WorkExecutor` is the reference consumer, and it exists so this is a measured claim rather than a rhetorical one. `WorkExecutorTests` drives the real planner through a fold storm, hands every directive to the real executor, and asserts that **no unit of work is ever started twice** — then does it again with a deliberately naive executor that folds `retain` into `admit`, and asserts that one *does* restart work. Without the negative control, the first test would only prove the planner never emitted a duplicate, not that honouring `retain` matters.
 
 ### 2. Growth and shrink are handled asymmetrically
@@ -91,7 +93,7 @@ public struct ReplanDirective {
 
 ### 3. Prefetch depth scales *sub-linearly* with area; the decode budget tracks the plan, not the glass
 
-Unfolding roughly doubles the viewport area but only widens the primary list by about 15% — the extra room goes to the detail pane, not to more rows. And scroll *velocity* does not change at all. So scaling prefetch with area would buy latency the user never perceives at a real network cost. Prefetch tracks `√area`: 4 rows on the cover display, 5 on the inner one.
+Unfolding roughly doubles the viewport area but only lengthens the primary list by about 15% — the extra room goes sideways, to the detail pane, not to more rows. (In the reference geometry that is 8 rows to 9, since the scale factor is applied to a row count and then floored.) And scroll *velocity* does not change at all. So scaling prefetch with area would buy latency the user never perceives at a real network cost. Prefetch tracks `√area`: 4 rows on the cover display, 5 on the inner one.
 
 The decode budget tracks the **plan**, not the glass: `(visibleWindow + prefetchDepth) × bytesPerRow`. Note that this is deliberately narrower than `admissionWindow` (`visibleWindow + 2 × prefetchDepth`) — they answer different questions. The admission window counts rows that may be *in flight*, prefetched in both directions. The decode budget counts rows that may be *decoded and resident at once*, which is the rows in front of the user; prefetch behind the anchor is fetched but not held as a bitmap, because scrolling backwards is the rarer motion and bitmaps are the expensive part. Bytes resident and requests outstanding are not one budget.
 
@@ -111,6 +113,8 @@ For a while nothing enforced that. Making `replan` async and dropping a single `
 2. Retaining a key asserts it is already in flight, so anything retained must appear in some `admit`.
 
 Both hold for any serial sequence of atomic passes and both break under interleaving. Restoring the suspension point produces `row:13 was started 6 times against 2 stops`.
+
+*Correction, kept rather than quietly edited out:* an earlier draft of this section claimed the per-directive coherence test "stays green against an interleaving planner". A later review measured it and that is **false** — under the suspension mutation both concurrency tests fire. Per-directive coherence is *logically* insufficient (a run can double-start work while every individual directive stays internally coherent), which is the real reason the second test exists; it is not empirically blind. The argument stands, the measurement attached to it did not.
 
 ### 5. Restoration is versioned and all-or-nothing
 
@@ -137,7 +141,7 @@ Two of these are worth naming because the obvious version of each is wrong in a 
 
 ## The test suite is designed to be able to fail
 
-**132 tests across 10 suites.** The ones worth looking at are in `FoldStormDriverTests`.
+**137 tests across 10 suites.** The ones worth looking at are in `FoldStormDriverTests`.
 
 `FoldStormDriver` checks six invariants — no duplicated fetches, no cancel-without-admission, no admit-and-cancel in one directive, no retention lie, no epoch regression, no unbounded growth (of either the in-flight set or the held-cancellation set). An invariant checker that has only ever been run against a correct implementation has not been shown to catch anything, so the suite ships **five deliberately broken planners** and asserts the driver goes red for each:
 
@@ -151,48 +155,66 @@ Two of these are worth naming because the obvious version of each is wrong in a 
 
 `testDriverDiscriminatesBetweenCorrectAndBrokenPlanners` asserts the real planner passes **and** all five mutants fail, in one test. Gutting the driver's checks turns that red.
 
-This is not decoration. **The harness and two rounds of independent adversarial review have each caught real bugs,** and every fix is commented at the site:
+This is not decoration. **The harness and three rounds of independent adversarial review have each caught real bugs,** and every fix is commented at the site:
 
 1. A key evicted partway through an admission pass was re-admitted later in the same pass, landing in both `cancel` and `admit`. Only reproduces under ledger pressure. Fix: freeze the admission list before the loop. *(Found by `FoldStormDriver`.)*
 2. The held-cancellation set was pruned only against the *desired* set, so a key evicted while held was cancelled twice — once as an eviction, again on settle — and the held set grew without bound. The reproducer is mundane: **fold the phone, then keep scrolling.** Fix: re-derive the held set from the ledger, which also bounds it by `ledgerCapacity`.
 3. The demand window **slid** off the front of the feed and **truncated** against the back — so the bottom of a feed, where pagination pressure is highest, silently got 9 rows of a 16-row window, and any stale anchor collapsed it to 1. The start-of-feed test asserted a row count; its mirror did not. The asymmetry in the assertions was the asymmetry in the code.
 4. `WorkLedger` reserved its own policy bound, crashing at construction for a large enough capacity (see §6).
 5. `WorkExecutor` advertised a priority queue over a directive that carried no priorities, so it started rows in lexicographic order — `row:10` ahead of `row:2` (see §1).
+6. **`WorkExecutor.finish` was keyed by `WorkKey` alone.** Cancellation is cooperative, so `task.cancel()` returns long before the body does — and if the same key was re-admitted meanwhile, the old body's eventual return evicted the **new** run's entry. The executor then believed the key was idle and the next re-admission started a second live body for one key: the duplicated-fetch failure this package exists to prevent, reintroduced inside its own reference consumer, on the cancel-then-re-admit path that *is* a fold storm. Fix: stamp every run with a unique id and ignore completions that do not match.
+7. `WorkExecutor.priorities` was pruned only on explicit cancellation, so it kept one entry per key the executor had ever been told about — an unbounded dictionary in the package whose whole thesis is that unbounded in-flight state is how a fold storm becomes an OOM.
+
+Bugs 6 and 7 are the ones worth dwelling on: both were in the component added *to prove* the headline invariant, and both survived a review round because the tests around them asserted the executor's own bookkeeping rather than what the work actually did.
 
 ### The mutation matrix
 
-Every claim above is re-derived by breaking the implementation and confirming the suite notices. Baseline is 132 tests, 0 failures.
+Every claim above is re-derived by breaking the implementation and confirming the suite notices. Baseline is **137 tests, 0 failures**. Counts are failing **test cases**, which are deterministic — assertion counts are not, because the concurrency tests assert per-directive and the number of directives that race varies by run.
 
 | Mutation | Result |
 |---|---|
-| Delete the `heldCancellations` ledger filter | **19 failures** — `the held set grew past the ledger it is supposed to describe` |
-| Re-read `!ledger.contains` live inside the admission loop | **2 failures** — `row:… was both admitted and cancelled in one directive` |
-| Suspend between freezing the admission list and consuming it | **36 failures** — `row:13 was started 6 times against 2 stops` |
-| Scale prefetch linearly with area | **12 failures** |
-| Truncate the demand window at the tail instead of sliding | **7 failures** |
-| Collapse an overflowed area to `0` | **3 failures** |
-| Make the executor consume `admit` rather than `admissionOrder` | **3 failures** |
+| Delete the `heldCancellations` ledger filter | 2 cases — `the held set grew past the ledger it is supposed to describe` |
+| Re-read `!ledger.contains` live inside the admission loop | 3 cases — `row:… was both admitted and cancelled in one directive` |
+| Suspend between freezing the admission list and consuming it | 2 cases — `row:… was started N times against M stops` |
+| Scale prefetch linearly with area | 6 cases |
+| Truncate the demand window at the tail instead of sliding | 2 cases |
+| Collapse an overflowed area to `0` | 2 cases |
+| Defer growth symmetrically with shrink | 5 cases |
+| Drop the demand model's 4,096-row ceiling | 1 case |
+| Let `Epoch.next()` wrap instead of saturate | 1 case |
+| Drop `.sortedKeys` from the snapshot encoder | 1 case |
 | `reserveCapacity` the ledger's policy bound | **process crash** — `swift_slowAlloc` via `Dictionary.reserveCapacity` |
-| Defer growth symmetrically with shrink | **13 failures** |
-| Drop `.sortedKeys` from the snapshot encoder | **1 failure** |
+| `apply` drops a task without calling `task.cancel()` | 1 case |
+| `cancelAll` drops every task without calling `task.cancel()` | 1 case |
+| `finish` keyed by `WorkKey` alone, with no run id | 1 case |
+| `priorities` never pruned on completion | 1 case |
+| `admissionOrder` ignores priority entirely | 1 case |
+| Superseded-epoch completions not counted | 1 case |
+| Executor consumes `admit` rather than `admissionOrder` | **green — by design**, see §1 |
+
+Seventeen red, one green-and-explained. The last row is listed precisely because a previous version of this table claimed it was red; it never was, and the fix was to pin the property where it could actually fail rather than to keep asserting it where it could not.
 
 Other things the suite deliberately does *not* do:
 
 - **No test calls a pure function twice and asserts the results match.** The encoder test asserts the emitted JSON keys are in *ascending order* — a property that disappears if `.sortedKeys` is removed — rather than that a pure function is deterministic within one process, which holds either way.
 - **No test asserts a value lies inside a range the implementation computed by clamping.** The pathological-anchor test asserts a *full window* of rows inside the feed, not merely that whatever came back was in range — the weaker version passed against a window that had collapsed to one row.
-- **Concurrency is asserted twice, at two different scopes.** Per-directive coherence (disjoint sets, bounded counts) across 64 real `TaskGroup` writers, *and* the cross-directive counting invariants in §4. The first is necessary and provably insufficient: it stays green against an interleaving planner, because each individual directive remains internally coherent while the run as a whole double-starts work.
+- **Concurrency is asserted twice, at two different scopes.** Per-directive coherence (disjoint sets, bounded counts) across 64 real `TaskGroup` writers, *and* the cross-directive counting invariants in §4. The first is necessary and logically insufficient: a run can double-start work while every individual directive stays internally coherent.
+- **No test asserts a component's own bookkeeping in place of what the work did.** `WorkExecutor.cancelCount` increments synchronously inside `apply` whether or not `Task.cancel()` was ever called, so asserting it proves nothing about cancellation — deleting the `cancel()` call used to leave the suite entirely green. The tests observe the *body* noticing.
+- **No timing is used as a synchronisation primitive.** A fixed number of `Task.yield()` calls is not a wait: on a loaded machine 10,000 yields can elapse before a spawned body is scheduled at all, which turns CI load into a red build — and it did. Waits are bounded by wall clock and **fail** on timeout rather than returning quietly, and the cancel-then-re-admit test parks its bodies on a continuation the test releases explicitly, so the overlap it is named after is a fact rather than a race.
 - Determinism is asserted across two **independently constructed** planners running the same script, not by calling one planner twice.
 
 ### What the suite does not cover
 
-`DisplayContinuityUI` has **no unit tests**. SwiftUI does not exist on the Linux runner where the suite executes, so the module compiles to zero symbols there; the macOS CI job builds it for an iOS Simulator destination but runs nothing. Everything asserted above is about `DisplayContinuity`, which is where all the logic deliberately lives — but "132 tests" is not a number about the view layer, and the two `ContinuityDemoModel` races fixed in review were found by reading, not by a failing test.
+`DisplayContinuityUI` has **no unit tests**. SwiftUI does not exist on the Linux runner where the suite executes, so the module compiles to zero symbols there; the macOS CI job builds it for an iOS Simulator destination but runs nothing. Everything asserted above is about `DisplayContinuity`, which is where all the logic deliberately lives — but "137 tests" is not a number about the view layer, and the two `ContinuityDemoModel` races fixed in review were found by reading, not by a failing test.
+
+The public types also carry **synthesised `Codable` conformances**, which are a second construction path that bypasses the clamping initialisers: `Viewport(width: -5)` is impossible, but decoding `{"width":-5}` is not. Nothing traps as a result — the `Saturating` layer holds downstream either way — but "the initialiser is total, so callers need not re-check" is a claim about one of the two doors. `ContinuitySnapshot` is the only type that validates after decoding.
 
 ---
 
 ## Usage
 
 ```swift
-.package(url: "https://github.com/rajatslakhina/display-continuity-kit.git", from: "1.0.0")
+.package(url: "https://github.com/rajatslakhina/display-continuity-kit.git", from: "1.1.0")
 ```
 
 ```swift
@@ -209,8 +231,11 @@ let directive = await planner.apply(
     at: MonotonicInstant(milliseconds: elapsedMilliseconds)
 )
 
-for key in directive.cancel { executor.cancel(key) }
-for key in directive.admit  { executor.start(key, epoch: directive.epoch) }
+// Your own executor, if you have one. `admissionOrder` is `admit` ranked by
+// distance from the anchor; `admit` itself is sorted lexicographically so that
+// two runs over the same input produce byte-identical directives.
+for key in directive.cancel        { myExecutor.stop(key) }
+for key in directive.admissionOrder { myExecutor.begin(key, epoch: directive.epoch) }
 // directive.retain is the work you did NOT have to touch.
 ```
 
@@ -240,8 +265,8 @@ Stated precisely, because "it builds" and "it runs" are different claims and onl
 | Check | Status |
 |---|---|
 | `swift build -Xswiftc -warnings-as-errors`, from a deleted `.build` | **Passed**, 0 warnings |
-| `swift test -Xswiftc -warnings-as-errors` | **Passed** — 132 tests, 0 failures, 10 suites |
-| Suite shown able to fail | **Yes** — 10 mutations, each one verified red; see the mutation matrix above |
+| `swift test -Xswiftc -warnings-as-errors` | **Passed** — 137 tests, 0 failures, 10 suites |
+| Suite shown able to fail | **Yes** — 17 mutations verified red, 1 verified green-and-explained; see the mutation matrix above |
 | Toolchain used locally | Swift 6.0.3, `aarch64-unknown-linux-gnu` |
 | Linux CI (`swift:6.0` container) | **Green** — see [Actions](../../actions). Builds and tests the core with warnings as errors |
 | iOS CI (`macos-15`) | **Green** — see [Actions](../../actions). Compiles `DisplayContinuityUI` for `generic/platform=iOS Simulator` |
@@ -253,7 +278,7 @@ The core is platform-agnostic Swift by design, precisely so it can be fully test
 
 Consequently there are **no screenshots** anywhere in either repo, and no mockup stands in for one.
 
-**Demo app:** [rajatslakhina/display-continuity-demo-app](https://github.com/rajatslakhina/display-continuity-demo-app) — a SwiftUI app that consumes this package as a **version-pinned remote** dependency (`upToNextMajorVersion` from `1.0.0`), not a local path. Its CI job resolves this package from GitHub on a clean `macos-15` runner with nothing cached and compiles the app against it; that repo's Actions tab is the record of whether it did. That is the cheapest honest proof that the published package works as a dependency — and it is a *compile* proof, not a run proof.
+**Demo app:** [rajatslakhina/display-continuity-demo-app](https://github.com/rajatslakhina/display-continuity-demo-app) — a SwiftUI app that consumes this package as a **version-pinned remote** dependency (`upToNextMajorVersion` from `1.0.0`, which resolves to the current `v1.1.0`), not a local path. Its CI job resolves this package from GitHub on a clean `macos-15` runner with nothing cached and compiles the app against it; that repo's Actions tab is the record of whether it did. That is the cheapest honest proof that the published package works as a dependency — and it is a *compile* proof, not a run proof.
 
 ---
 

@@ -474,6 +474,64 @@ final class ContinuityPlannerTests: XCTestCase {
 
     // MARK: - Directive shape
 
+    /// `admissionOrder` pinned in isolation, because nothing downstream can.
+    ///
+    /// `WorkExecutor` re-sorts its pending queue by priority on every apply,
+    /// which is correct — and which makes consuming `admit` instead of
+    /// `admissionOrder` inside the executor **invisible from the outside**: the
+    /// queue ends up sorted either way. That double defence is good engineering
+    /// and bad coverage. It meant the executor-level ordering test could not
+    /// fail for the property it was named after, and a mutation swapping the
+    /// two left the whole suite green. The ordering is asserted here, at the
+    /// only layer where nothing else compensates for it.
+    func testAdmissionOrderRanksByPriorityWhileAdmitStaysLexicographic() {
+        let plan = CapacityPlan(
+            displayClass: .compact,
+            visibleWindow: 4,
+            prefetchDepth: 0,
+            concurrentDecodes: 2,
+            decodeByteBudget: 1_024
+        )
+        let keys = (0 ..< 12).map { WorkKey("row:\($0)") }
+        let directive = ReplanDirective(
+            epoch: .initial,
+            plan: plan,
+            admit: keys,
+            cancel: [],
+            retain: [],
+            admissionPriority: Dictionary(uniqueKeysWithValues: keys.enumerated().map { ($1, $0) })
+        )
+
+        // `admit` is lexicographic on purpose — reproducible diffs, not a schedule.
+        XCTAssertEqual(
+            Array(directive.admit.prefix(3)),
+            [WorkKey("row:0"), WorkKey("row:1"), WorkKey("row:10")],
+            "admit must stay lexicographic; that is why the priority field exists"
+        )
+        XCTAssertEqual(
+            Array(directive.admissionOrder.prefix(4)),
+            [WorkKey("row:0"), WorkKey("row:1"), WorkKey("row:2"), WorkKey("row:3")],
+            "admissionOrder must rank by priority, not by string comparison"
+        )
+        XCTAssertEqual(
+            Set(directive.admissionOrder),
+            Set(directive.admit),
+            "the two orderings must describe the same set"
+        )
+
+        // Keys with no recorded priority sort last, deterministically, so a
+        // hand-built directive degrades rather than trapping.
+        let partial = ReplanDirective(
+            epoch: .initial,
+            plan: plan,
+            admit: [WorkKey("a"), WorkKey("b")],
+            cancel: [],
+            retain: [],
+            admissionPriority: [WorkKey("b"): 0]
+        )
+        XCTAssertEqual(partial.admissionOrder, [WorkKey("b"), WorkKey("a")])
+    }
+
     func testDirectiveSetsAreDisjointAndSorted() async {
         let planner = makePlanner(items: 200, ledgerCapacity: 20)
         _ = await planner.apply(SurfaceInput(viewport: .coverDisplay, anchor: 0, selection: selection), at: at(0))
